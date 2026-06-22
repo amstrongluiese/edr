@@ -5,6 +5,7 @@ from typing import Any
 
 from .db import execute, fetch_one, json_dumps, utc_now
 from .models import NormalizedEvent
+from .sessions import get_current_session_id
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -20,6 +21,7 @@ def normalize_event(raw: dict[str, Any]) -> NormalizedEvent:
     event_type = str(raw.get("event_type") or raw.get("type") or "connection").lower()
     timestamp = str(raw.get("timestamp") or utc_now())
     port = _int_or_none(raw.get("port") or raw.get("destination_port"))
+    source_port = _int_or_none(raw.get("source_port") or raw.get("local_port"))
     bytes_sent = int(raw.get("bytes_sent") or 0)
     bytes_received = int(raw.get("bytes_received") or 0)
     bytes_total = int(raw.get("bytes_total") or bytes_sent + bytes_received)
@@ -37,6 +39,8 @@ def normalize_event(raw: dict[str, Any]) -> NormalizedEvent:
         source_ip=raw.get("source_ip"),
         destination_ip=raw.get("destination_ip") or raw.get("dest_ip"),
         port=port,
+        source_port=source_port,
+        direction=raw.get("direction"),
         protocol=raw.get("protocol"),
         process_name=raw.get("process_name") or raw.get("process"),
         pid=_int_or_none(raw.get("pid")),
@@ -96,6 +100,7 @@ def _is_inventory_device(ip: str | None, mac: str | None, discovery_source: str 
 
 
 def persist_event(event: NormalizedEvent) -> None:
+    session_id = get_current_session_id()
     if event.event_type in {"device", "device_seen"} and event.ip:
         device_key = _device_key(event.ip, event.mac, event.hostname)
         is_inventory = _is_inventory_device(event.ip, event.mac, event.discovery_source)
@@ -115,6 +120,7 @@ def persist_event(event: NormalizedEvent) -> None:
                         discovery_source = ?,
                         device_key = ?,
                         is_inventory_device = ?
+                        , session_id = ?
                     WHERE id = ?
                     """,
                     (
@@ -128,6 +134,7 @@ def persist_event(event: NormalizedEvent) -> None:
                         event.discovery_source,
                         device_key,
                         is_inventory,
+                        session_id,
                         existing["id"],
                     ),
                 )
@@ -135,8 +142,8 @@ def persist_event(event: NormalizedEvent) -> None:
         execute(
             """
             INSERT INTO devices(ip, mac, hostname, vendor, device_type, first_seen, last_seen,
-                                trust_status, online_status, discovery_source, device_key, is_inventory_device)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                trust_status, online_status, discovery_source, device_key, is_inventory_device, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ip) DO UPDATE SET
                 mac=COALESCE(excluded.mac, devices.mac),
                 hostname=COALESCE(excluded.hostname, devices.hostname),
@@ -148,6 +155,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 discovery_source=excluded.discovery_source,
                 device_key=excluded.device_key,
                 is_inventory_device=excluded.is_inventory_device
+                , session_id=excluded.session_id
             """,
             (
                 event.ip,
@@ -162,14 +170,15 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.discovery_source,
                 device_key,
                 is_inventory,
+                session_id,
             ),
         )
     elif event.event_type in {"dns", "dns_query"} and event.domain:
         _observe_ip(event.source_ip, event.timestamp, "passive_network_observation")
         execute(
             """
-            INSERT INTO dns_logs(timestamp, source_ip, domain, query_type, resolved_ip, raw_event)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO dns_logs(timestamp, source_ip, domain, query_type, resolved_ip, raw_event, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -178,6 +187,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.query_type,
                 event.resolved_ip,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
     elif event.event_type in {"traffic", "traffic_window"}:
@@ -185,8 +195,8 @@ def persist_event(event: NormalizedEvent) -> None:
         _observe_ip(event.destination_ip, event.timestamp, "passive_network_observation")
         execute(
             """
-            INSERT INTO traffic_logs(timestamp, source_ip, destination_ip, bytes_total, window_seconds, raw_event)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO traffic_logs(timestamp, source_ip, destination_ip, bytes_total, window_seconds, raw_event, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -195,6 +205,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.bytes_total,
                 event.window_seconds,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
     elif event.event_type in {"file", "file_event", "file_scan"} and event.file_path:
@@ -203,8 +214,8 @@ def persist_event(event: NormalizedEvent) -> None:
             extension = "." + event.file_path.rsplit(".", 1)[-1].lower()
         execute(
             """
-            INSERT INTO file_events(timestamp, path, extension, sha256, signed_status, source, risk_score, evidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO file_events(timestamp, path, extension, sha256, signed_status, source, risk_score, evidence, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -215,14 +226,15 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.log_source or event.event_type,
                 0,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
     elif event.event_type in {"process", "process_event", "process_scan"}:
         execute(
             """
             INSERT INTO process_events(timestamp, process_name, pid, parent_process, command_line,
-                                       executable_path, sha256, signed_status, source, evidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                       executable_path, sha256, signed_status, source, evidence, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -235,6 +247,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 "signed" if event.signed else "unsigned_or_unknown",
                 event.log_source or event.event_type,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
     elif event.event_type in {"auth_log", "access_log", "database_log", "server_log", "application_log"}:
@@ -242,8 +255,8 @@ def persist_event(event: NormalizedEvent) -> None:
         execute(
             """
             INSERT INTO log_events(timestamp, log_source, event_type, username, source_ip, device,
-                                   target_system, outcome, raw_event)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   target_system, outcome, raw_event, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -255,6 +268,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.target_system,
                 event.outcome,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
     else:
@@ -262,9 +276,9 @@ def persist_event(event: NormalizedEvent) -> None:
         _observe_ip(event.destination_ip, event.timestamp, "passive_network_observation")
         execute(
             """
-            INSERT INTO connections(timestamp, process_name, pid, source_ip, destination_ip, port, protocol,
-                                    bytes_sent, bytes_received, event_type, raw_event)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO connections(timestamp, process_name, pid, source_ip, destination_ip, source_port, port, protocol,
+                                    direction, bytes_sent, bytes_received, event_type, raw_event, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -272,12 +286,15 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.pid,
                 event.source_ip,
                 event.destination_ip,
+                event.source_port,
                 event.port,
                 event.protocol,
+                event.direction,
                 event.bytes_sent,
                 event.bytes_received,
                 event.event_type,
                 json_dumps(event.raw),
+                session_id,
             ),
         )
 
@@ -293,16 +310,17 @@ def _observe_ip(ip: str | None, timestamp: str, source: str) -> None:
         merged_source = ",".join(sorted(parts))
     execute(
         """
-        INSERT INTO devices(ip, first_seen, last_seen, trust_status, risk_level, risk_score, online_status, discovery_source, device_key, is_inventory_device)
-        VALUES (?, ?, ?, 'unknown', 'Informational', 0, 'online', ?, ?, ?)
+        INSERT INTO devices(ip, first_seen, last_seen, trust_status, risk_level, risk_score, online_status, discovery_source, device_key, is_inventory_device, session_id)
+        VALUES (?, ?, ?, 'unknown', 'Informational', 0, 'online', ?, ?, ?, ?)
         ON CONFLICT(ip) DO UPDATE SET
             last_seen=excluded.last_seen,
             online_status='online',
             discovery_source=excluded.discovery_source,
             device_key=COALESCE(devices.device_key, excluded.device_key),
             is_inventory_device=MAX(devices.is_inventory_device, excluded.is_inventory_device)
+            , session_id=excluded.session_id
         """,
-        (ip, timestamp, timestamp, merged_source, _device_key(ip, None, None), _is_inventory_device(ip, None, merged_source)),
+        (ip, timestamp, timestamp, merged_source, _device_key(ip, None, None), _is_inventory_device(ip, None, merged_source), get_current_session_id()),
     )
 
 

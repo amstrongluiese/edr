@@ -9,6 +9,7 @@ from .db import execute, fetch_all, init_db, json_dumps, utc_now
 from .detection import analyze_event
 from .ingestion import ingest
 from .performance import record_system_metrics
+from .sessions import get_current_session_id
 from .threat_intel import seed_intel_db
 
 
@@ -192,6 +193,7 @@ def run_validation() -> dict[str, Any]:
     results = []
     bucket = int(time.time()) % 200 + 1
     validation_run_id = f"validation-{int(time.time())}"
+    session_id = get_current_session_id()
     for test in validation_tests():
         start = time.perf_counter()
         alert_ids: list[int] = []
@@ -211,10 +213,10 @@ def run_validation() -> dict[str, Any]:
         execute(
             """
             INSERT INTO validation_results(timestamp, test_name, expected_malicious, detected_malicious,
-                                           outcome, response_ms, alert_ids, notes, validation_run_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                           outcome, response_ms, alert_ids, notes, validation_run_id, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (utc_now(), test.name, int(test.expected_malicious), int(detected), outcome, response_ms, json_dumps(alert_ids), notes, validation_run_id),
+            (utc_now(), test.name, int(test.expected_malicious), int(detected), outcome, response_ms, json_dumps(alert_ids), notes, validation_run_id, session_id),
         )
         results.append({"test": test.name, "expected_malicious": test.expected_malicious, "detected": detected, "outcome": outcome, "response_ms": response_ms})
 

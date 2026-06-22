@@ -5,18 +5,24 @@ import json
 from .db import fetch_all
 
 
-def _rows(table: str, limit: int = 25):
-    return fetch_all(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,))
+def _rows(table: str, limit: int = 25, session_id: str | None = None):
+    if session_id:
+        return fetch_all(f"SELECT * FROM {table} WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, limit))
+    return fetch_all(f"SELECT * FROM {table} WHERE 1 = 0 ORDER BY id DESC LIMIT ?", (limit,))
 
 
-def generate_analysis() -> str:
-    alerts = _rows("alerts", 20)
-    incidents = _rows("incidents", 10)
-    validations = _rows("validation_results", 20)
-    metrics = _rows("performance_metrics", 20)
-    scan_results = _rows("scan_results", 10)
-    failed_attempts = _rows("failed_attempts", 10)
-    cves = _rows("cve_matches", 10)
+def generate_analysis(session_id: str | None = None) -> str:
+    if session_id is None:
+        from .sessions import get_current_session_id
+
+        session_id = get_current_session_id()
+    alerts = _rows("alerts", 20, session_id)
+    incidents = _rows("incidents", 10, session_id)
+    validations = _rows("validation_results", 20, session_id)
+    metrics = _rows("performance_metrics", 20, session_id)
+    scan_results = _rows("scan_results", 10, session_id)
+    failed_attempts = _rows("failed_attempts", 10, session_id)
+    cves = _rows("cve_matches", 10, session_id)
 
     high_alerts = [row for row in alerts if row["severity"] in {"High Risk", "Critical"}]
     outcomes = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}

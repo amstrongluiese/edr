@@ -5,6 +5,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 REPORT_DIR = BASE_DIR / "reports"
 THREAT_INTEL_DIR = BASE_DIR / "threat_intel"
+ARCHIVE_DIR = BASE_DIR / "archives"
 DB_PATH = DATA_DIR / "edr.sqlite3"
 
 RISK_WEIGHTS = {
@@ -28,6 +29,7 @@ RISK_WEIGHTS = {
     "successful_login_after_failures": 40,
     "database_access_attempt": 30,
     "malicious_url": 40,
+    "possible_doh": 20,
 }
 
 RISKY_PORTS = {21, 23, 135, 139, 445, 3389, 5900, 5985, 5986}
@@ -55,8 +57,10 @@ MITRE_MAP = {
     "successful_login_after_failures": ("Credential Access", "Brute Force", "T1110"),
     "database_access_attempt": ("Collection", "Data from Information Repositories", "T1213"),
     "malicious_url": ("Command and Control", "Application Layer Protocol", "T1071"),
+    "possible_doh": ("Command and Control", "Application Layer Protocol", "T1071"),
 }
 
 SCAN_PATH_NAMES = ["Downloads", "Desktop", "Documents", "AppData\\Roaming", "AppData\\Local\\Temp"]
 MONITORED_EXTENSIONS = {".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".jar", ".scr", ".msi"}
 SUSPICIOUS_PATH_MARKERS = ["\\appdata\\local\\temp\\", "\\appdata\\roaming\\", "\\downloads\\", "\\startup\\"]
+DOH_DOMAINS = {"cloudflare-dns.com", "dns.google", "dns.quad9.net", "dns.nextdns.io", "mozilla.cloudflare-dns.com"}

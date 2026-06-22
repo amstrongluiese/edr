@@ -6,6 +6,7 @@ from .ai_analyst import generate_analysis
 from .config import REPORT_DIR
 from .db import execute, fetch_all, init_db, utc_now
 from .detection import summarize_counts
+from .sessions import get_current_session_id
 
 
 def _write_report(name: str, content: str) -> Path:
@@ -13,15 +14,16 @@ def _write_report(name: str, content: str) -> Path:
     path = REPORT_DIR / name
     path.write_text(content, encoding="utf-8")
     execute(
-        "INSERT INTO reports(created_at, report_type, path, summary) VALUES (?, ?, ?, ?)",
-        (utc_now(), name.replace(".md", ""), str(path), content.splitlines()[0] if content else "Report"),
+        "INSERT INTO reports(created_at, report_type, path, summary, session_id) VALUES (?, ?, ?, ?, ?)",
+        (utc_now(), name.replace(".md", ""), str(path), content.splitlines()[0] if content else "Report", get_current_session_id()),
     )
     return path
 
 
 def technical_report() -> Path:
-    counts = summarize_counts()
-    alerts = fetch_all("SELECT * FROM alerts ORDER BY id DESC LIMIT 20")
+    session_id = get_current_session_id()
+    counts = summarize_counts(session_id)
+    alerts = fetch_all("SELECT * FROM alerts WHERE session_id = ? ORDER BY id DESC LIMIT 20", (session_id,)) if session_id else []
     lines = [
         "# Technical EDR Report",
         "",
@@ -40,11 +42,12 @@ def technical_report() -> Path:
 
 
 def validation_report() -> Path:
-    latest = fetch_all("SELECT validation_run_id FROM validation_results WHERE validation_run_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+    session_id = get_current_session_id()
+    latest = fetch_all("SELECT validation_run_id FROM validation_results WHERE validation_run_id IS NOT NULL AND session_id = ? ORDER BY id DESC LIMIT 1", (session_id,)) if session_id else []
     if latest:
-        rows = fetch_all("SELECT * FROM validation_results WHERE validation_run_id = ? ORDER BY id DESC", (latest[0]["validation_run_id"],))
+        rows = fetch_all("SELECT * FROM validation_results WHERE validation_run_id = ? AND session_id = ? ORDER BY id DESC", (latest[0]["validation_run_id"], session_id))
     else:
-        rows = fetch_all("SELECT * FROM validation_results ORDER BY id DESC LIMIT 100")
+        rows = []
     outcomes = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
     for row in rows:
         outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
@@ -73,13 +76,15 @@ def ai_report() -> Path:
 
 
 def final_overall_report() -> Path:
-    counts = summarize_counts()
-    latest = fetch_all("SELECT validation_run_id FROM validation_results WHERE validation_run_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+    session_id = get_current_session_id()
+    counts = summarize_counts(session_id)
+    latest = fetch_all("SELECT validation_run_id FROM validation_results WHERE validation_run_id IS NOT NULL AND session_id = ? ORDER BY id DESC LIMIT 1", (session_id,)) if session_id else []
     if latest:
-        validations = fetch_all("SELECT * FROM validation_results WHERE validation_run_id = ? ORDER BY id DESC", (latest[0]["validation_run_id"],))
+        validations = fetch_all("SELECT * FROM validation_results WHERE validation_run_id = ? AND session_id = ? ORDER BY id DESC", (latest[0]["validation_run_id"], session_id))
     else:
-        validations = fetch_all("SELECT * FROM validation_results ORDER BY id DESC LIMIT 100")
-    metrics = fetch_all("SELECT * FROM performance_metrics ORDER BY id DESC LIMIT 30")
+        validations = []
+    metrics = fetch_all("SELECT * FROM performance_metrics WHERE session_id = ? ORDER BY id DESC LIMIT 30", (session_id,)) if session_id else []
+    verification = fetch_all("SELECT * FROM testing_verification WHERE session_id = ? ORDER BY id DESC", (session_id,)) if session_id else []
     outcomes = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
     for row in validations:
         outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
@@ -100,6 +105,7 @@ def final_overall_report() -> Path:
         "",
         "## Was it a true detection?",
         f"Validation TP={outcomes['TP']} TN={outcomes['TN']} FP={outcomes['FP']} FN={outcomes['FN']}.",
+        f"Testing verification records={len(verification)}.",
         "",
         "## Why was it flagged?",
         "Each alert stores evidence JSON, score, reason, data source, and MITRE mapping in SQLite.",

@@ -10,6 +10,7 @@ from typing import Any
 from .db import execute, utc_now
 from .detection import analyze_event
 from .ingestion import ingest
+from .sessions import get_current_session_id
 
 
 ARP_RE = re.compile(r"(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<mac>[0-9a-fA-F:-]{11,17})\s+(?P<kind>\w+)")
@@ -235,14 +236,21 @@ def discover_network_devices(active_scan: bool = True) -> list[dict[str, Any]]:
 
 
 def import_discovered_devices(active_scan: bool = True) -> int:
-    execute("UPDATE devices SET online_status = 'offline' WHERE online_status = 'online'")
-    execute("DELETE FROM devices WHERE ip LIKE '224.%' OR ip LIKE '239.%' OR ip LIKE '255.%' OR ip LIKE '%.255'")
+    session_id = get_current_session_id()
+    execute("UPDATE devices SET online_status = 'offline' WHERE online_status = 'online' AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)", (session_id, session_id))
+    execute(
+        "DELETE FROM devices WHERE (ip LIKE '224.%' OR ip LIKE '239.%' OR ip LIKE '255.%' OR ip LIKE '%.255') AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)",
+        (session_id, session_id),
+    )
     count = 0
     for raw in discover_network_devices(active_scan=active_scan):
         event = ingest(raw)
         analyze_event(event)
         count += 1
-    execute("INSERT INTO performance_metrics(timestamp, metric_name, metric_value, unit, context) VALUES (?, ?, ?, ?, ?)", (utc_now(), "device_discovery_count", count, "devices", "{}"))
+    execute(
+        "INSERT INTO performance_metrics(timestamp, metric_name, metric_value, unit, context, session_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (utc_now(), "device_discovery_count", count, "devices", "{}", get_current_session_id()),
+    )
     return count
 
 

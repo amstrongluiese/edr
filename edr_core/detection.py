@@ -7,11 +7,12 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from .config import MITRE_MAP, RISKY_PORTS, SUSPICIOUS_PATH_MARKERS, SUSPICIOUS_TLDS
+from .config import DOH_DOMAINS, MITRE_MAP, RISKY_PORTS, SUSPICIOUS_PATH_MARKERS, SUSPICIOUS_TLDS
 from .db import execute, fetch_all, fetch_one, json_dumps, record_metric, utc_now
 from .models import AlertCandidate, NormalizedEvent
 from .risk import risk_level
-from .threat_intel import match_cves, match_iocs
+from .sessions import get_current_session_id
+from .threat_intel import match_cves, match_iocs, match_port_cves
 
 
 SAFE_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "svchost.exe", "system", "teams.exe"}
@@ -30,16 +31,24 @@ def _add_alert(candidate: AlertCandidate) -> int:
     tactic, technique, attack_id = MITRE_MAP.get(candidate.alert_type, ("Unmapped", "Unmapped", "N/A"))
     severity = risk_level(candidate.score)
     now = utc_now()
-    evidence_json = json_dumps(candidate.evidence)
+    session_id = get_current_session_id()
+    enriched_evidence = {
+        **candidate.evidence,
+        "score_breakdown": {candidate.alert_type: candidate.score},
+        "data_source": candidate.evidence.get("data_source") or candidate.evidence.get("source") or candidate.evidence.get("discovery_source") or "telemetry",
+        "detection_confidence": "confirmed" if candidate.alert_type.startswith("malicious_") or candidate.alert_type == "critical_cve" else "suspected",
+    }
+    evidence_json = json_dumps(enriched_evidence)
     evidence_hash = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
     existing = fetch_one(
         """
         SELECT id, occurrence_count, score
         FROM alerts
         WHERE alert_type = ? AND entity = ? AND evidence_hash = ? AND status IN ('open', 'grouped')
+          AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)
         ORDER BY id DESC LIMIT 1
         """,
-        (candidate.alert_type, candidate.entity, evidence_hash),
+        (candidate.alert_type, candidate.entity, evidence_hash, session_id, session_id),
     )
     if existing:
         execute(
@@ -60,8 +69,8 @@ def _add_alert(candidate: AlertCandidate) -> int:
     alert_id = execute(
         """
         INSERT INTO alerts(timestamp, first_seen, last_seen, alert_type, entity, severity, score, evidence,
-                           evidence_hash, reason, mitre_tactic, mitre_technique, mitre_id, occurrence_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                           evidence_hash, reason, mitre_tactic, mitre_technique, mitre_id, occurrence_count, session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """,
         (
             now,
@@ -77,6 +86,7 @@ def _add_alert(candidate: AlertCandidate) -> int:
             tactic,
             technique,
             attack_id,
+            session_id,
         ),
     )
     _update_device_risk(candidate)
@@ -163,6 +173,16 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     "Domain shape or TLD is suspicious compared with normal browsing patterns.",
                 )
             )
+        if domain in DOH_DOMAINS or any(domain.endswith("." + item) for item in DOH_DOMAINS):
+            candidates.append(
+                AlertCandidate(
+                    "possible_doh",
+                    domain,
+                    20,
+                    {"domain": domain, "source_ip": event.source_ip, "data_source": event.log_source or event.event_type},
+                    "Endpoint contacted a known DNS-over-HTTPS provider; normal DNS query visibility may be reduced.",
+                )
+            )
         for match in match_iocs(domain=domain, ip=event.resolved_ip):
             score = 40 if match["type"] in {"malicious_ip", "malicious_domain"} else 30
             candidates.append(
@@ -203,6 +223,23 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     15,
                     {"destination_ip": event.destination_ip, "port": event.port, "process": event.process_name},
                     f"Connection targets risky port {event.port}.",
+                )
+            )
+        for cve in match_port_cves(event.port):
+            cvss = float(cve["cvss"])
+            candidates.append(
+                AlertCandidate(
+                    "critical_cve",
+                    cve["software"],
+                    50 if cvss >= 9 else 30,
+                    {
+                        **cve,
+                        "source_ip": event.source_ip,
+                        "destination_ip": event.destination_ip,
+                        "port": event.port,
+                        "data_source": event.log_source or event.event_type,
+                    },
+                    f"Open or active port {event.port} maps to {cve['cve']} exposure guidance with CVSS {cve['cvss']}.",
                 )
             )
         if stats["same_destination_count"] >= 8:
@@ -374,8 +411,8 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
         cve_severity = "Critical" if cvss >= 9 else "High" if cvss >= 7 else "Medium" if cvss >= 4 else "Low"
         execute(
             """
-            INSERT INTO cve_matches(timestamp, product, version, cve_id, cvss, severity, description, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cve_matches(timestamp, product, version, cve_id, cvss, severity, description, source, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utc_now(),
@@ -386,6 +423,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                 cve_severity,
                 cve["summary"],
                 "local_nvd_style_cache",
+                get_current_session_id(),
             ),
         )
         candidates.append(
@@ -426,8 +464,8 @@ def _failed_attempt_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
         execute(
             """
             INSERT INTO failed_attempts(timestamp, username, source_ip, device, target_system,
-                                        failed_count, window_seconds, evidence_logs)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                        failed_count, window_seconds, evidence_logs, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 utc_now(),
@@ -438,6 +476,7 @@ def _failed_attempt_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                 len(failed_rows),
                 300,
                 json.dumps(evidence_logs),
+                get_current_session_id(),
             ),
         )
         candidates.append(
@@ -479,7 +518,11 @@ def _failed_attempt_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
 
 
 def correlate_incidents() -> None:
-    open_alerts = fetch_all("SELECT * FROM alerts WHERE status = 'open' ORDER BY id DESC LIMIT 100")
+    session_id = get_current_session_id()
+    open_alerts = fetch_all(
+        "SELECT * FROM alerts WHERE status = 'open' AND ((? IS NULL AND session_id IS NULL) OR session_id = ?) ORDER BY id DESC LIMIT 100",
+        (session_id, session_id),
+    )
     grouped: dict[str, list[Any]] = defaultdict(list)
     for alert in open_alerts:
         grouped[alert["entity"]].append(alert)
@@ -501,10 +544,10 @@ def correlate_incidents() -> None:
         }
         execute(
             """
-            INSERT INTO incidents(created_at, updated_at, title, severity, score, alert_ids, evidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO incidents(created_at, updated_at, title, severity, score, alert_ids, evidence, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (utc_now(), utc_now(), title, severity, score, json.dumps(alert_ids), json_dumps(evidence)),
+            (utc_now(), utc_now(), title, severity, score, json.dumps(alert_ids), json_dumps(evidence), session_id),
         )
         for alert_id in alert_ids:
             execute("UPDATE alerts SET status = 'correlated' WHERE id = ?", (alert_id,))
@@ -518,7 +561,34 @@ def analyze_event(event: NormalizedEvent) -> list[int]:
     return alert_ids
 
 
-def summarize_counts() -> dict[str, int]:
+def summarize_counts(session_id: str | None = None) -> dict[str, int]:
+    if session_id is None:
+        from .sessions import get_current_session_id
+
+        session_id = get_current_session_id()
+    where = "WHERE session_id = ?"
+    params = (session_id,)
+    if not session_id:
+        return {
+            "devices": 0,
+            "connections": 0,
+            "dns_logs": 0,
+            "alerts": 0,
+            "incidents": 0,
+            "validation_results": 0,
+            "scan_results": 0,
+            "file_events": 0,
+            "process_events": 0,
+            "log_events": 0,
+            "failed_attempts": 0,
+            "cve_matches": 0,
+            "unique_devices": 0,
+            "online_devices": 0,
+            "offline_devices": 0,
+            "unknown_devices": 0,
+            "grouped_alerts": 0,
+            "risk_score": 0,
+        }
     summary = {}
     for table in [
         "devices",
@@ -534,18 +604,18 @@ def summarize_counts() -> dict[str, int]:
         "failed_attempts",
         "cve_matches",
     ]:
-        row = fetch_one(f"SELECT COUNT(*) AS count FROM {table}")
+        row = fetch_one(f"SELECT COUNT(*) AS count FROM {table} {where}", params)
         summary[table] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1")
+    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND session_id = ?", params)
     summary["unique_devices"] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND online_status = 'online'")
+    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND online_status = 'online' AND session_id = ?", params)
     summary["online_devices"] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND online_status != 'online'")
+    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND online_status != 'online' AND session_id = ?", params)
     summary["offline_devices"] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND trust_status = 'unknown'")
+    row = fetch_one("SELECT COUNT(*) AS count FROM devices WHERE is_inventory_device = 1 AND trust_status = 'unknown' AND session_id = ?", params)
     summary["unknown_devices"] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COUNT(*) AS count FROM (SELECT alert_type, entity FROM alerts GROUP BY alert_type, entity)")
+    row = fetch_one("SELECT COUNT(*) AS count FROM (SELECT alert_type, entity FROM alerts WHERE session_id = ? GROUP BY alert_type, entity)", params)
     summary["grouped_alerts"] = int(row["count"] if row else 0)
-    row = fetch_one("SELECT COALESCE(MAX(risk_score), 0) AS score FROM devices WHERE is_inventory_device = 1")
+    row = fetch_one("SELECT COALESCE(MAX(risk_score), 0) AS score FROM devices WHERE is_inventory_device = 1 AND session_id = ?", params)
     summary["risk_score"] = int(row["score"] if row else 0)
     return summary

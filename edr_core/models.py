@@ -9,6 +9,8 @@ class NormalizedEvent:
     source_ip: str | None = None
     destination_ip: str | None = None
     port: int | None = None
+    source_port: int | None = None
+    direction: str | None = None
     protocol: str | None = None
     process_name: str | None = None
     pid: int | None = None
