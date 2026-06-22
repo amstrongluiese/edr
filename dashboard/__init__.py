@@ -1,0 +1,2 @@
+"""Tkinter dashboard package."""
+

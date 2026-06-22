@@ -1,0 +1,25 @@
+{
+  "services": {
+    "OpenSSH": {
+      "7.2": {
+        "cve": "CVE-2016-0777",
+        "cvss": 7.5,
+        "summary": "Roaming vulnerability in older OpenSSH clients."
+      }
+    },
+    "Apache httpd": {
+      "2.4.49": {
+        "cve": "CVE-2021-41773",
+        "cvss": 9.8,
+        "summary": "Path traversal and file disclosure vulnerability."
+      }
+    },
+    "Microsoft Exchange": {
+      "2019-CU8": {
+        "cve": "CVE-2021-26855",
+        "cvss": 9.8,
+        "summary": "Server-side request forgery vulnerability."
+      }
+    }
+  }
+}

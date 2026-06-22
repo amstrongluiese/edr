@@ -1,0 +1,3 @@
+malware-test.example
+command-control.example
+phishing-lab.invalid

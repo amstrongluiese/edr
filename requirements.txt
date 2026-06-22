@@ -1,0 +1,2 @@
+# No required third-party dependencies.
+# Optional: install psutil manually for richer performance metrics in future extensions.

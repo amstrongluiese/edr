@@ -1,0 +1,30 @@
+{
+  "source": "local curated MITRE ATT&CK subset",
+  "techniques": [
+    {
+      "id": "T1071",
+      "name": "Application Layer Protocol",
+      "tactic": "Command and Control"
+    },
+    {
+      "id": "T1046",
+      "name": "Network Service Discovery",
+      "tactic": "Discovery"
+    },
+    {
+      "id": "T1568.002",
+      "name": "Domain Generation Algorithms",
+      "tactic": "Command and Control"
+    },
+    {
+      "id": "T1105",
+      "name": "Ingress Tool Transfer",
+      "tactic": "Command and Control"
+    },
+    {
+      "id": "T1190",
+      "name": "Exploit Public-Facing Application",
+      "tactic": "Initial Access"
+    }
+  ]
+}

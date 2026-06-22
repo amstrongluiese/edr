@@ -1,0 +1,2 @@
+http://malware-test.example/dropper.exe
+http://command-control.example/beacon
