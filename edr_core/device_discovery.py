@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import ipaddress
+import csv
 import re
-import subprocess
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
-from .db import execute, utc_now
+from .db import execute, fetch_all, utc_now
 from .detection import analyze_event
 from .ingestion import ingest
 from .sessions import get_current_session_id
+from .subprocess_utils import run_hidden
 
 
 ARP_RE = re.compile(r"(?P<ip>\d+\.\d+\.\d+\.\d+)\s+(?P<mac>[0-9a-fA-F:-]{11,17})\s+(?P<kind>\w+)")
-IPCONFIG_IPV4_RE = re.compile(r"IPv4 Address[.\s]*:\s*(?P<ip>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
+IPCONFIG_IPV4_RE = re.compile(r"IPv4 Address[^:]*:\s*(?P<ip>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
+IPCONFIG_MASK_RE = re.compile(r"Subnet Mask[^:]*:\s*(?P<mask>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
 NSLOOKUP_NAME_RE = re.compile(r"Name:\s*(?P<name>\S+)", re.IGNORECASE)
 
 VENDOR_PREFIXES = {
@@ -43,11 +46,7 @@ def _now() -> str:
 
 
 def _run(command: list[str], timeout: int = 8) -> str:
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout
+    return run_hidden(command, timeout)
 
 
 def _normalize_mac(mac: str | None) -> str:
@@ -84,6 +83,7 @@ def estimate_device_type(hostname: str | None, vendor: str | None, ip: str | Non
     return "unknown/unclassified"
 
 
+@lru_cache(maxsize=2048)
 def hostname_lookup(ip: str) -> str:
     if ip.startswith(("224.", "239.", "255.", "0.", "169.254.")):
         return ""
@@ -132,11 +132,20 @@ def discover_from_arp_table() -> list[dict[str, Any]]:
 
 
 def discover_from_neighbor_table() -> list[dict[str, Any]]:
-    output = _run(["netsh", "interface", "ip", "show", "neighbors"])
+    output = _run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+            "Where-Object {$_.State -notin @('Unreachable','Incomplete')} | "
+            "Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Csv -NoTypeInformation",
+        ]
+    )
     devices: list[dict[str, Any]] = []
-    for match in ARP_RE.finditer(output):
-        ip = match.group("ip")
-        mac = _normalize_mac(match.group("mac"))
+    for row in csv.DictReader(output.splitlines()) if output else []:
+        ip = (row.get("IPAddress") or "").strip()
+        mac = _normalize_mac(row.get("LinkLayerAddress"))
         if not _is_device_ip(ip, mac):
             continue
         vendor = lookup_vendor(mac)
@@ -160,16 +169,22 @@ def discover_from_neighbor_table() -> list[dict[str, Any]]:
 
 def local_subnets() -> list[ipaddress.IPv4Network]:
     output = _run(["ipconfig"])
-    ips = []
-    for match in IPCONFIG_IPV4_RE.finditer(output):
-        ip = match.group("ip")
+    ips_and_masks: list[tuple[str, str]] = []
+    pending_ip = ""
+    for line in output.splitlines():
+        ip_match = IPCONFIG_IPV4_RE.search(line)
+        mask_match = IPCONFIG_MASK_RE.search(line)
+        if ip_match:
+            pending_ip = ip_match.group("ip")
+        elif mask_match and pending_ip:
+            ips_and_masks.append((pending_ip, mask_match.group("mask")))
+            pending_ip = ""
+    networks = []
+    for ip, mask in ips_and_masks:
         if ip.startswith(("127.", "169.254.")):
             continue
-        ips.append(ip)
-    networks = []
-    for ip in ips:
         try:
-            network = ipaddress.ip_network(f"{ip}/24", strict=False)
+            network = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
         except ValueError:
             continue
         if network not in networks:
@@ -183,11 +198,11 @@ def _ping(ip: str) -> bool:
     return "TTL=" in output.upper()
 
 
-def ping_sweep(limit_hosts: int = 254, max_workers: int = 96) -> list[str]:
+def ping_sweep(limit_hosts: int = 65_534, max_workers: int = 96) -> list[str]:
     responsive: list[str] = []
     targets = []
     for network in local_subnets():
-        targets.extend(str(host) for host in list(network.hosts())[:limit_hosts])
+        targets.extend(str(host) for index, host in enumerate(network.hosts()) if index < limit_hosts)
     if not targets:
         return responsive
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -237,16 +252,28 @@ def discover_network_devices(active_scan: bool = True) -> list[dict[str, Any]]:
 
 def import_discovered_devices(active_scan: bool = True) -> int:
     session_id = get_current_session_id()
-    execute("UPDATE devices SET online_status = 'offline' WHERE online_status = 'online' AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)", (session_id, session_id))
     execute(
         "DELETE FROM devices WHERE (ip LIKE '224.%' OR ip LIKE '239.%' OR ip LIKE '255.%' OR ip LIKE '%.255') AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)",
         (session_id, session_id),
     )
     count = 0
-    for raw in discover_network_devices(active_scan=active_scan):
+    discovered = discover_network_devices(active_scan=active_scan)
+    seen_ips = {raw["ip"] for raw in discovered}
+    for raw in discovered:
         event = ingest(raw)
         analyze_event(event)
         count += 1
+    rows = fetch_all(
+        "SELECT id, ip, missed_scans, online_status FROM devices WHERE is_inventory_device = 1 AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)",
+        (session_id, session_id),
+    )
+    for row in rows:
+        if row["ip"] in seen_ips:
+            execute("UPDATE devices SET missed_scans = 0, online_status = 'online' WHERE id = ?", (row["id"],))
+            continue
+        missed = int(row["missed_scans"] or 0) + 1
+        status = "offline" if missed >= 6 else "recently_seen" if missed >= 3 else row["online_status"]
+        execute("UPDATE devices SET missed_scans = ?, online_status = ? WHERE id = ?", (missed, status, row["id"]))
     execute(
         "INSERT INTO performance_metrics(timestamp, metric_name, metric_value, unit, context, session_id) VALUES (?, ?, ?, ?, ?, ?)",
         (utc_now(), "device_discovery_count", count, "devices", "{}", get_current_session_id()),

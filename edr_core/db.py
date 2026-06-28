@@ -60,9 +60,10 @@ def init_db() -> None:
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 trust_status TEXT NOT NULL DEFAULT 'unknown',
-                risk_level TEXT NOT NULL DEFAULT 'Informational',
+                risk_level TEXT NOT NULL DEFAULT 'INFORMATIONAL',
                 risk_score INTEGER NOT NULL DEFAULT 0,
                 online_status TEXT NOT NULL DEFAULT 'unknown',
+                missed_scans INTEGER NOT NULL DEFAULT 0,
                 discovery_source TEXT NOT NULL DEFAULT 'telemetry',
                 device_key TEXT,
                 is_inventory_device INTEGER NOT NULL DEFAULT 1
@@ -92,6 +93,8 @@ def init_db() -> None:
                 domain TEXT NOT NULL,
                 query_type TEXT,
                 resolved_ip TEXT,
+                classification TEXT NOT NULL DEFAULT 'SAFE',
+                confidence_score INTEGER NOT NULL DEFAULT 0,
                 raw_event TEXT NOT NULL
             );
 
@@ -114,6 +117,10 @@ def init_db() -> None:
                 entity TEXT NOT NULL,
                 severity TEXT NOT NULL,
                 score INTEGER NOT NULL,
+                classification TEXT NOT NULL DEFAULT 'INFORMATIONAL',
+                confidence_score INTEGER NOT NULL DEFAULT 0,
+                confidence_label TEXT NOT NULL DEFAULT 'Low',
+                evidence_count INTEGER NOT NULL DEFAULT 1,
                 evidence TEXT NOT NULL,
                 evidence_hash TEXT,
                 reason TEXT NOT NULL,
@@ -156,10 +163,16 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 test_name TEXT NOT NULL,
+                expected_label TEXT NOT NULL DEFAULT 'SAFE',
+                actual_label TEXT NOT NULL DEFAULT 'SAFE',
                 expected_malicious INTEGER NOT NULL,
                 detected_malicious INTEGER NOT NULL,
                 outcome TEXT NOT NULL,
                 response_ms REAL NOT NULL,
+                cpu_seconds REAL NOT NULL DEFAULT 0,
+                memory_mb REAL NOT NULL DEFAULT 0,
+                confidence_score INTEGER NOT NULL DEFAULT 0,
+                evidence TEXT NOT NULL DEFAULT '{}',
                 alert_ids TEXT NOT NULL,
                 notes TEXT NOT NULL,
                 validation_run_id TEXT
@@ -286,14 +299,27 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "devices", "online_status", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "devices", "missed_scans", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "devices", "discovery_source", "TEXT NOT NULL DEFAULT 'telemetry'")
         _ensure_column(conn, "devices", "device_key", "TEXT")
         _ensure_column(conn, "devices", "is_inventory_device", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "validation_results", "validation_run_id", "TEXT")
+        _ensure_column(conn, "validation_results", "expected_label", "TEXT NOT NULL DEFAULT 'SAFE'")
+        _ensure_column(conn, "validation_results", "actual_label", "TEXT NOT NULL DEFAULT 'SAFE'")
+        _ensure_column(conn, "validation_results", "cpu_seconds", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "validation_results", "memory_mb", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(conn, "validation_results", "confidence_score", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "validation_results", "evidence", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "alerts", "first_seen", "TEXT")
         _ensure_column(conn, "alerts", "last_seen", "TEXT")
         _ensure_column(conn, "alerts", "evidence_hash", "TEXT")
         _ensure_column(conn, "alerts", "occurrence_count", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "alerts", "classification", "TEXT NOT NULL DEFAULT 'INFORMATIONAL'")
+        _ensure_column(conn, "alerts", "confidence_score", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "alerts", "confidence_label", "TEXT NOT NULL DEFAULT 'Low'")
+        _ensure_column(conn, "alerts", "evidence_count", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "dns_logs", "classification", "TEXT NOT NULL DEFAULT 'SAFE'")
+        _ensure_column(conn, "dns_logs", "confidence_score", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "connections", "source_port", "INTEGER")
         _ensure_column(conn, "connections", "direction", "TEXT")
         for table in [
@@ -324,6 +350,31 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_alerts_last_seen ON alerts(last_seen);
             CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, timestamp, event_type);
             CREATE INDEX IF NOT EXISTS idx_testing_session ON testing_verification(session_id, timestamp);
+            UPDATE devices
+            SET risk_level = CASE
+                WHEN risk_score = 0 THEN 'SAFE'
+                WHEN risk_score <= 10 THEN 'INFORMATIONAL'
+                WHEN risk_score <= 30 THEN 'LOW RISK'
+                WHEN risk_score <= 60 THEN 'SUSPICIOUS'
+                WHEN risk_score <= 85 THEN 'HIGH RISK'
+                ELSE 'CONFIRMED THREAT'
+            END;
+            UPDATE alerts
+            SET classification = CASE
+                WHEN MAX(score, confidence_score) = 0 THEN 'SAFE'
+                WHEN MAX(score, confidence_score) <= 10 THEN 'INFORMATIONAL'
+                WHEN MAX(score, confidence_score) <= 30 THEN 'LOW RISK'
+                WHEN MAX(score, confidence_score) <= 60 THEN 'SUSPICIOUS'
+                WHEN MAX(score, confidence_score) <= 85 THEN 'HIGH RISK'
+                ELSE 'CONFIRMED THREAT'
+            END,
+            confidence_label = CASE
+                WHEN confidence_score <= 30 THEN 'Low'
+                WHEN confidence_score <= 60 THEN 'Medium'
+                WHEN confidence_score <= 85 THEN 'High'
+                ELSE 'Confirmed'
+            END
+            WHERE confidence_score = 0;
             """
         )
 

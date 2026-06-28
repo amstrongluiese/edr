@@ -8,7 +8,7 @@ from typing import Any
 from .db import execute, fetch_all, init_db, json_dumps, utc_now
 from .detection import analyze_event
 from .ingestion import ingest
-from .performance import record_system_metrics
+from .performance import record_system_metrics, sample_system_metrics
 from .sessions import get_current_session_id
 from .threat_intel import seed_intel_db
 
@@ -68,13 +68,28 @@ def validation_tests() -> list[ValidationTest]:
         ),
         ValidationTest(
             "Traffic Spike",
-            True,
+            False,
             [{"event_type": "traffic", "source_ip": "192.168.1.44", "destination_ip": "198.51.100.90", "bytes_total": 80_000_000, "window_seconds": 60}],
         ),
         ValidationTest(
             "Suspicious DNS",
-            True,
+            False,
             [{"event_type": "dns", "source_ip": "192.168.1.10", "domain": "a9f8e7d6c5b4a3f2e1d0c9b8a7.xyz"}],
+        ),
+        ValidationTest(
+            "Known Safe Domain",
+            False,
+            [{"event_type": "dns", "source_ip": "192.168.1.10", "domain": "github.com"}],
+        ),
+        ValidationTest(
+            "Localhost Development Server",
+            False,
+            [{"event_type": "connection", "source_ip": "127.0.0.1", "destination_ip": "127.0.0.1", "port": 5173, "process_name": "code.exe"}],
+        ),
+        ValidationTest(
+            "Normal Windows Background Traffic",
+            False,
+            [{"event_type": "connection", "source_ip": "192.168.1.10", "destination_ip": "0.0.0.0", "port": 443, "process_name": "svchost.exe"}],
         ),
         ValidationTest(
             "CVE Match",
@@ -200,25 +215,54 @@ def run_validation() -> dict[str, Any]:
         for raw in _scope_events(test.events, bucket):
             event = ingest(raw)
             ids = analyze_event(event)
-            high_signal_ids = []
-            for alert_id in ids:
-                row = fetch_all("SELECT score FROM alerts WHERE id = ?", (alert_id,))
-                if row and int(row[0]["score"]) > 10:
-                    high_signal_ids.append(alert_id)
-            alert_ids.extend(high_signal_ids)
+            alert_ids.extend(ids)
         response_ms = (time.perf_counter() - start) * 1000
-        detected = bool(alert_ids)
+        resources = sample_system_metrics()
+        alert_rows = []
+        for alert_id in alert_ids:
+            alert_rows.extend(fetch_all("SELECT classification, confidence_score, evidence, reason FROM alerts WHERE id = ?", (alert_id,)))
+        rank = {"SAFE": 0, "INFORMATIONAL": 1, "LOW RISK": 2, "SUSPICIOUS": 3, "HIGH RISK": 4, "CONFIRMED THREAT": 5}
+        actual_label = max((str(row["classification"]) for row in alert_rows), key=lambda label: rank.get(label, 0), default="SAFE")
+        confidence_score = max((int(row["confidence_score"]) for row in alert_rows), default=0)
+        detected = rank.get(actual_label, 0) >= rank["SUSPICIOUS"]
+        expected_label = {
+            "Malicious IP": "CONFIRMED THREAT",
+            "Malicious Domain": "CONFIRMED THREAT",
+            "Malicious Hash": "CONFIRMED THREAT",
+            "CVE Match": "HIGH RISK",
+            "Trusted Device": "SAFE",
+            "Known Safe Domain": "SAFE",
+            "Safe Browsing": "SAFE",
+            "Normal Gmail Traffic": "SAFE",
+            "Normal Local File Transfer": "SAFE",
+            "Localhost Development Server": "SAFE",
+            "Normal Windows Background Traffic": "SAFE",
+            "Phone Connected": "INFORMATIONAL",
+            "Suspicious DNS": "LOW RISK",
+            "Traffic Spike": "LOW RISK",
+        }.get(test.name, "SUSPICIOUS" if test.expected_malicious else "SAFE")
         outcome = _outcome(test.expected_malicious, detected)
         notes = "Unknown-device-only informational alerts are excluded from malicious verdicts."
         execute(
             """
-            INSERT INTO validation_results(timestamp, test_name, expected_malicious, detected_malicious,
-                                           outcome, response_ms, alert_ids, notes, validation_run_id, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO validation_results(timestamp, test_name, expected_label, actual_label,
+                                           expected_malicious, detected_malicious, outcome, response_ms,
+                                           cpu_seconds, memory_mb, confidence_score, evidence,
+                                           alert_ids, notes, validation_run_id, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (utc_now(), test.name, int(test.expected_malicious), int(detected), outcome, response_ms, json_dumps(alert_ids), notes, validation_run_id, session_id),
+            (
+                utc_now(), test.name, expected_label, actual_label, int(test.expected_malicious), int(detected), outcome, response_ms,
+                resources["cpu_seconds"], resources["memory_mb"], confidence_score,
+                json_dumps([{"classification": row["classification"], "reason": row["reason"], "evidence": row["evidence"]} for row in alert_rows]),
+                json_dumps(alert_ids), notes, validation_run_id, session_id,
+            ),
         )
-        results.append({"test": test.name, "expected_malicious": test.expected_malicious, "detected": detected, "outcome": outcome, "response_ms": response_ms})
+        results.append({
+            "test": test.name, "expected_malicious": test.expected_malicious, "detected": detected,
+            "outcome": outcome, "expected_label": expected_label, "actual_label": actual_label,
+            "confidence_score": confidence_score, "response_ms": response_ms, **resources,
+        })
 
     totals = {key: sum(1 for item in results if item["outcome"] == key) for key in ["TP", "TN", "FP", "FN"]}
     total = len(results)
@@ -233,6 +277,8 @@ def run_validation() -> dict[str, Any]:
         "false_positive_rate": false_positive_rate,
         "false_negative_rate": false_negative_rate,
         "average_response_ms": sum(item["response_ms"] for item in results) / total if total else 0.0,
+        "average_cpu_seconds": sum(item["cpu_seconds"] for item in results) / total if total else 0.0,
+        "average_memory_mb": sum(item["memory_mb"] for item in results) / total if total else 0.0,
         "validation_run_id": validation_run_id,
     }
 

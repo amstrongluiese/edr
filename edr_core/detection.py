@@ -10,9 +10,10 @@ from typing import Any
 from .config import DOH_DOMAINS, MITRE_MAP, RISKY_PORTS, SUSPICIOUS_PATH_MARKERS, SUSPICIOUS_TLDS
 from .db import execute, fetch_all, fetch_one, json_dumps, record_metric, utc_now
 from .models import AlertCandidate, NormalizedEvent
-from .risk import risk_level
+from .risk import confidence_label, evidence_classification, risk_level
 from .sessions import get_current_session_id
 from .threat_intel import match_cves, match_iocs, match_port_cves
+from .accuracy_rules import domain_is_safe, ip_is_safe, match_sigma, match_yara_like, process_is_safe, vendor_is_safe
 
 
 SAFE_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "svchost.exe", "system", "teams.exe"}
@@ -32,14 +33,58 @@ def _add_alert(candidate: AlertCandidate) -> int:
     severity = risk_level(candidate.score)
     now = utc_now()
     session_id = get_current_session_id()
+    historical = fetch_one(
+        "SELECT COALESCE(SUM(occurrence_count), 0) AS count FROM alerts WHERE alert_type = ? AND entity = ?",
+        (candidate.alert_type, candidate.entity),
+    )
+    history_count = int(historical["count"] if historical else 0)
+    is_intel = candidate.alert_type.startswith("malicious_")
+    is_cve = candidate.alert_type == "critical_cve"
+    evidence_types = list(dict.fromkeys(candidate.evidence.get("supporting_evidence", [candidate.alert_type])))
+    evidence_count = len(evidence_types)
+    intel_confidence = int(candidate.evidence.get("match", {}).get("confidence", 0) or 0)
+    cve_confidence = round(float(candidate.evidence.get("cvss", 0) or 0) * 10)
+    confidence_score = min(
+        100,
+        max(
+            intel_confidence,
+            cve_confidence,
+            max(0, int(candidate.score))
+            + (20 if is_intel else 0)
+            + (15 if is_cve else 0)
+            + (0 if candidate.alert_type in {"unknown_device", "new_device", "repeated_connections", "possible_doh"} else 5 if attack_id != "N/A" else 0)
+            + (30 if evidence_count >= 2 else 0)
+            + min(15, history_count * 3),
+        ),
+    )
+    classification = evidence_classification(
+        candidate.alert_type,
+        evidence_types,
+        has_ioc=is_intel,
+        has_cve=is_cve,
+        validation_confirmed=bool(candidate.evidence.get("validation_confirmed")),
+    )
     enriched_evidence = {
         **candidate.evidence,
         "score_breakdown": {candidate.alert_type: candidate.score},
         "data_source": candidate.evidence.get("data_source") or candidate.evidence.get("source") or candidate.evidence.get("discovery_source") or "telemetry",
-        "detection_confidence": "confirmed" if candidate.alert_type.startswith("malicious_") or candidate.alert_type == "critical_cve" else "suspected",
+        "classification": classification,
+        "confidence_score": confidence_score,
+        "confidence_label": confidence_label(confidence_score),
+        "evidence_count": evidence_count,
+        "evidence_list": evidence_types,
+        "explanation": candidate.reason,
+        "evidence_fusion": {
+            "behavior_analysis": candidate.alert_type,
+            "threat_intelligence": is_intel,
+            "cve_correlation": is_cve,
+            "mitre_mapping": attack_id,
+            "historical_occurrences": history_count,
+        },
     }
     evidence_json = json_dumps(enriched_evidence)
-    evidence_hash = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+    stable_evidence = json_dumps({"alert_type": candidate.alert_type, "entity": candidate.entity, "evidence": candidate.evidence})
+    evidence_hash = hashlib.sha256(stable_evidence.encode("utf-8")).hexdigest()
     existing = fetch_one(
         """
         SELECT id, occurrence_count, score
@@ -59,18 +104,33 @@ def _add_alert(candidate: AlertCandidate) -> int:
                 occurrence_count = occurrence_count + 1,
                 score = MAX(score, ?),
                 severity = ?,
+                classification = ?,
+                confidence_score = MAX(confidence_score, ?),
+                confidence_label = ?,
+                evidence_count = MAX(evidence_count, ?),
                 status = 'grouped'
             WHERE id = ?
             """,
-            (now, now, candidate.score, risk_level(max(int(existing["score"]), candidate.score)), existing["id"]),
+            (
+                now,
+                now,
+                candidate.score,
+                risk_level(max(int(existing["score"]), candidate.score)),
+                classification,
+                confidence_score,
+                confidence_label(confidence_score),
+                evidence_count,
+                existing["id"],
+            ),
         )
         _update_device_risk(candidate)
         return int(existing["id"])
     alert_id = execute(
         """
-        INSERT INTO alerts(timestamp, first_seen, last_seen, alert_type, entity, severity, score, evidence,
+        INSERT INTO alerts(timestamp, first_seen, last_seen, alert_type, entity, severity, score,
+                           classification, confidence_score, confidence_label, evidence_count, evidence,
                            evidence_hash, reason, mitre_tactic, mitre_technique, mitre_id, occurrence_count, session_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """,
         (
             now,
@@ -80,6 +140,10 @@ def _add_alert(candidate: AlertCandidate) -> int:
             candidate.entity,
             severity,
             candidate.score,
+            classification,
+            confidence_score,
+            confidence_label(confidence_score),
+            evidence_count,
             evidence_json,
             evidence_hash,
             candidate.reason,
@@ -139,7 +203,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
 
     if event.event_type in {"device", "device_seen"} and event.ip:
         existing = fetch_one("SELECT trust_status FROM devices WHERE ip = ?", (event.ip,))
-        if event.trust_status == "unknown" or (existing and existing["trust_status"] == "unknown"):
+        if (event.trust_status == "unknown" or (existing and existing["trust_status"] == "unknown")) and not vendor_is_safe(event.vendor):
             candidates.append(
                 AlertCandidate(
                     "unknown_device",
@@ -163,7 +227,8 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
 
     if event.event_type in {"dns", "dns_query"} and event.domain:
         domain = event.domain.lower()
-        if any(domain.endswith(tld) for tld in SUSPICIOUS_TLDS) or len(domain.split(".")[0]) > 24:
+        safe_domain = domain_is_safe(domain)
+        if not safe_domain and (any(domain.endswith(tld) for tld in SUSPICIOUS_TLDS) or len(domain.split(".")[0]) > 24):
             candidates.append(
                 AlertCandidate(
                     "suspicious_dns",
@@ -197,6 +262,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
 
     if event.event_type in {"connection", "network", "process_connection"}:
         stats = _connection_stats(event.source_ip, event.destination_ip)
+        safe_connection = ip_is_safe(event.source_ip) or ip_is_safe(event.destination_ip) or process_is_safe(event.process_name)
         if event.destination_ip:
             for match in match_iocs(ip=event.destination_ip, file_hash=event.file_hash):
                 score = 50 if match["type"] == "malicious_hash" else 40
@@ -242,7 +308,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     f"Open or active port {event.port} maps to {cve['cve']} exposure guidance with CVSS {cve['cvss']}.",
                 )
             )
-        if stats["same_destination_count"] >= 8:
+        if stats["same_destination_count"] >= 8 and not safe_connection:
             candidates.append(
                 AlertCandidate(
                     "beaconing",
@@ -252,7 +318,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     "Repeated connections to the same destination indicate possible beaconing.",
                 )
             )
-        if stats["recent_count"] >= 20:
+        if stats["recent_count"] >= 20 and not safe_connection:
             candidates.append(
                 AlertCandidate(
                     "repeated_connections",
@@ -262,7 +328,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     "High repeated connection volume observed in the recent telemetry window.",
                 )
             )
-        if stats["unique_ports"] >= 12:
+        if stats["unique_ports"] >= 12 and not safe_connection:
             candidates.append(
                 AlertCandidate(
                     "port_scan",
@@ -273,7 +339,7 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                 )
             )
         process = (event.process_name or "").lower()
-        if process in SUSPICIOUS_PROCESS_NAMES or (process.startswith("powershell") and event.destination_ip):
+        if process in SUSPICIOUS_PROCESS_NAMES or (process.startswith("powershell") and event.destination_ip and not process_is_safe(process)):
             candidates.append(
                 AlertCandidate(
                     "suspicious_process",
@@ -384,6 +450,27 @@ def detect_candidates(event: NormalizedEvent) -> list[AlertCandidate]:
                     f"Process hash matched threat intelligence source {match['source']}.",
                 )
             )
+
+    for match in match_sigma(event):
+        candidates.append(
+            AlertCandidate(
+                "sigma_rule",
+                event.process_name or event.username or event.source_ip or "local-endpoint",
+                int(match.get("score", 35)),
+                {"sigma": match, "process_name": event.process_name, "command_line": event.command_line},
+                f"Offline Sigma rule matched: {match.get('title', match.get('id', 'Sigma rule'))}.",
+            )
+        )
+    for match in match_yara_like(event):
+        candidates.append(
+            AlertCandidate(
+                "yara_rule",
+                event.file_path or event.process_name or "local-artifact",
+                int(match.get("score", 35)),
+                {"yara": match, "file_path": event.file_path, "command_line": event.command_line},
+                f"Offline YARA-compatible rule matched: {match['rule']}.",
+            )
+        )
 
     if event.event_type in {"auth_log", "access_log", "database_log", "server_log", "application_log"}:
         if event.event_type == "database_log" or "database" in (event.target_system or "").lower():
@@ -555,7 +642,21 @@ def correlate_incidents() -> None:
 
 def analyze_event(event: NormalizedEvent) -> list[int]:
     start = time.perf_counter()
-    alert_ids = [_add_alert(candidate) for candidate in detect_candidates(event)]
+    candidates = detect_candidates(event)
+    for candidate in candidates:
+        supporting = list(dict.fromkeys(item.alert_type for item in candidates))
+        if candidate.alert_type == "failed_attempts":
+            supporting.extend(f"failed_login_{index + 1}" for index in range(min(3, int(candidate.evidence.get("failed_count", 0)))))
+        if candidate.alert_type == "beaconing":
+            supporting.extend(["connection_repetition", "timing_pattern"])
+        if candidate.alert_type == "port_scan":
+            supporting.extend(["multi_port_contact", "scan_pattern"])
+        if candidate.alert_type == "sigma_rule":
+            supporting.extend(["sigma_rule", "sigma_process_context"])
+        if candidate.alert_type == "yara_rule":
+            supporting.extend(["yara_rule", "content_pattern"])
+        candidate.evidence["supporting_evidence"] = list(dict.fromkeys(supporting))
+    alert_ids = [_add_alert(candidate) for candidate in candidates]
     correlate_incidents()
     record_metric("detection_time", (time.perf_counter() - start) * 1000, "ms", {"event_type": event.event_type})
     return alert_ids

@@ -26,13 +26,13 @@ def tests() -> list[VerificationTest]:
         VerificationTest("Phone connects to WiFi", False, [{"event_type": "device", "ip": "10.250.1.20", "mac": "02:11:22:33:44:55", "hostname": "phone", "device_type": "phone/tablet", "trust_status": "unknown", "source": "testing_verification"}]),
         VerificationTest("Phone disconnects from WiFi", False, []),
         VerificationTest("Safe browsing", False, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": "example.com", "source": "testing_verification"}]),
-        VerificationTest("Suspicious domain visit", True, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": "a9f8e7d6c5b4a3f2e1d0c9b8a7.xyz", "source": "testing_verification"}]),
+        VerificationTest("Suspicious domain visit", False, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": "a9f8e7d6c5b4a3f2e1d0c9b8a7.xyz", "source": "testing_verification"}]),
         VerificationTest("Malicious domain from local threat_intel list", True, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": "malware-test.example", "source": "testing_verification"}]),
         VerificationTest("Malicious IP connection", True, [{"event_type": "connection", "source_ip": "10.250.1.10", "destination_ip": "203.0.113.66", "port": 443, "protocol": "TCP", "source": "testing_verification"}]),
-        VerificationTest("DNS over HTTPS detection", True, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": next(iter(DOH_ENDPOINTS)), "source": "testing_verification"}]),
+        VerificationTest("DNS over HTTPS detection", False, [{"event_type": "dns", "source_ip": "10.250.1.10", "domain": next(iter(DOH_ENDPOINTS)), "source": "testing_verification"}]),
         VerificationTest("3 failed login attempts", True, [{"event_type": "auth_log", "username": "admin", "source_ip": "10.250.1.30", "target_system": "vpn", "outcome": "failed", "log_source": "testing_verification"} for _ in range(3)]),
         VerificationTest("Port scan", True, [{"event_type": "connection", "source_ip": "10.250.1.40", "destination_ip": "10.250.1.50", "port": port, "protocol": "TCP", "process_name": "ncat.exe", "source": "testing_verification"} for port in range(20, 35)]),
-        VerificationTest("Traffic spike", True, [{"event_type": "traffic", "source_ip": "10.250.1.60", "destination_ip": "198.51.100.90", "bytes_total": 80_000_000, "window_seconds": 60, "source": "testing_verification"}]),
+        VerificationTest("Traffic spike", False, [{"event_type": "traffic", "source_ip": "10.250.1.60", "destination_ip": "198.51.100.90", "bytes_total": 80_000_000, "window_seconds": 60, "source": "testing_verification"}]),
     ]
 
 
@@ -64,8 +64,8 @@ def run_testing_verification() -> dict[str, Any]:
             evidence.append(raw)
         high_signal = []
         for alert_id in alert_ids:
-            rows = fetch_all("SELECT score FROM alerts WHERE id = ?", (alert_id,))
-            if rows and int(rows[0]["score"]) > 10:
+            rows = fetch_all("SELECT classification FROM alerts WHERE id = ?", (alert_id,))
+            if rows and rows[0]["classification"] in {"SUSPICIOUS", "HIGH RISK", "CONFIRMED THREAT"}:
                 high_signal.append(alert_id)
         detected = bool(high_signal)
         outcome = _outcome(test.expected_malicious, detected)

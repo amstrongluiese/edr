@@ -29,10 +29,12 @@ if ($LASTEXITCODE -ne 0) {
     exit 2
 }
 
-New-Item -ItemType Directory -Force dist\EDR_System\config,dist\EDR_System\logs,dist\EDR_System\reports,dist\EDR_System\threat_intel | Out-Null
-& $python -m PyInstaller --noconfirm --windowed --name EDR_System run_dashboard.py
-Copy-Item -Recurse -Force threat_intel\* dist\EDR_System\threat_intel\
-Copy-Item -Recurse -Force reports\* dist\EDR_System\reports\ -ErrorAction SilentlyContinue
-Copy-Item -Force README.md,AUDIT.md,start_dashboard.ps1 dist\EDR_System\
-Write-Host "Installable folder prepared at dist\EDR_System"
+& $python -m PyInstaller --noconfirm --clean EDR_System.spec
+New-Item -ItemType Directory -Force dist\config,dist\logs,dist\reports,dist\threat_intel,dist\rules | Out-Null
+Copy-Item -Recurse -Force config\* dist\config\
+Copy-Item -Recurse -Force rules\* dist\rules\
+Copy-Item -Recurse -Force threat_intel\* dist\threat_intel\
+Copy-Item -Recurse -Force reports\* dist\reports\ -ErrorAction SilentlyContinue
+Copy-Item -Force README.md,AUDIT.md dist\
+Write-Host "Installable EXE prepared at dist\EDR_System.exe"
 

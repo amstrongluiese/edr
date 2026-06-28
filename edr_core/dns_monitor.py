@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from .db import execute, utc_now
@@ -12,6 +11,7 @@ from .detection import analyze_event
 from .ingestion import ingest
 from .session_events import record_session_event
 from .sessions import get_current_session_id
+from .subprocess_utils import run_hidden
 
 
 DNS_RECORD_RE = re.compile(r"Record Name[ .]*:\s*(?P<domain>\S+)", re.IGNORECASE)
@@ -25,11 +25,7 @@ DOH_ENDPOINTS = {
 
 
 def _run(command: list[str], timeout: int = 8) -> str:
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout
+    return run_hidden(command, timeout)
 
 
 def collect_dns_cache() -> dict[str, int | str]:
@@ -96,7 +92,17 @@ def scan_browser_history(read_only_permission: bool = False, limit: int = 250) -
                 pass
         for url, title, last_visit_time in rows:
             record_session_event("browser_history_observed", url, {"url": url, "title": title, "browser_history_time": last_visit_time})
-            ingest({"event_type": "dns", "timestamp": utc_now(), "domain": str(url).split("/")[2] if "://" in str(url) else str(url), "source": "browser_history"})
+            event = ingest(
+                {
+                    "event_type": "dns",
+                    "timestamp": utc_now(),
+                    "domain": str(url).split("/")[2] if "://" in str(url) else str(url),
+                    "url": str(url),
+                    "query_type": "browser_history",
+                    "source": "browser_history",
+                }
+            )
+            analyze_event(event)
             count += 1
     return count
 

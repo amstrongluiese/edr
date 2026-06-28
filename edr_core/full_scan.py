@@ -3,26 +3,24 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
-import subprocess
 import time
 from pathlib import Path
+from collections.abc import Callable
+from threading import Event
 from typing import Any
 
 from .config import MONITORED_EXTENSIONS, SCAN_PATH_NAMES, SUSPICIOUS_PATH_MARKERS
-from .db import execute, init_db, json_dumps, record_metric, utc_now
+from .db import execute, fetch_one, init_db, json_dumps, record_metric, utc_now
 from .detection import analyze_event
 from .ingestion import ingest
-from .performance import record_system_metrics
+from .performance import record_system_metrics, sample_system_metrics
 from .risk import risk_level
 from .sessions import get_current_session_id
+from .subprocess_utils import run_hidden
 
 
 def _run(command: list[str], timeout: int = 20) -> str:
-    try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout
+    return run_hidden(command, timeout)
 
 
 def signature_status(path: Path) -> bool | None:
@@ -84,10 +82,12 @@ def _file_risk(path: Path, file_hash: str) -> tuple[int, dict[str, Any]]:
     return min(score, 100), evidence
 
 
-def scan_files(limit_per_root: int = 250) -> int:
+def scan_files(limit_per_root: int = 250, root_names: set[str] | None = None) -> int:
     session_id = get_current_session_id()
     count = 0
     for root in scan_roots():
+        if root_names and not any(name.lower() in str(root).lower() for name in root_names):
+            continue
         scanned = 0
         for path in root.rglob("*"):
             if scanned >= limit_per_root:
@@ -344,18 +344,84 @@ def collect_windows_event_logs(limit: int = 60) -> int:
     return count
 
 
-def run_full_scan() -> dict[str, int | float]:
+def run_full_scan(
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    stop_event: Event | None = None,
+) -> dict[str, int | float | str]:
+    from .device_discovery import import_discovered_devices
+    from .dns_monitor import collect_dns_cache, detect_doh_connections
+    from .detection import summarize_counts
+    from .threat_intel import seed_intel_db, threat_intel_counts
+
     init_db()
     start = time.perf_counter()
-    results = {
-        "processes": scan_processes(),
-        "services": scan_services(),
-        "startup_items": scan_startup_programs(),
-        "open_ports": scan_open_ports(),
-        "files": scan_files(),
-        "installed_software": scan_installed_software(),
-        "windows_events": collect_windows_event_logs(),
-    }
+    def dns_stage() -> int:
+        dns = collect_dns_cache()
+        detect_doh_connections()
+        return int(dns.get("dns_events", 0))
+
+    def cve_stage() -> int:
+        scan_installed_software()
+        row = fetch_one("SELECT COUNT(*) AS count FROM cve_matches WHERE session_id = ?", (get_current_session_id(),))
+        return int(row["count"] if row else 0)
+
+    def rule_stage() -> int:
+        collect_windows_event_logs()
+        row = fetch_one(
+            "SELECT COUNT(*) AS count FROM alerts WHERE session_id = ? AND alert_type IN ('sigma_rule','yara_rule')",
+            (get_current_session_id(),),
+        )
+        return int(row["count"] if row else 0)
+
+    stages = [
+        ("initializing", "Initializing scan", lambda: 0),
+        ("processes", "Scanning processes", scan_processes),
+        ("startup_items", "Scanning startup entries", scan_startup_programs),
+        ("services", "Scanning services", scan_services),
+        ("files", "Scanning files", lambda: scan_files(root_names={"Documents", "Desktop"})),
+        ("downloads", "Scanning Downloads", lambda: scan_files(root_names={"Downloads"})),
+        ("appdata", "Scanning AppData", lambda: scan_files(root_names={"AppData\\Roaming"})),
+        ("temp", "Scanning Temp", lambda: scan_files(root_names={"AppData\\Local\\Temp"})),
+        ("network_devices", "Scanning network devices", import_discovered_devices),
+        ("open_ports", "Scanning open ports", scan_open_ports),
+        ("dns_browser", "Checking DNS and browser safety", dns_stage),
+        ("threat_intelligence", "Matching threat intelligence", lambda: (seed_intel_db() or sum(threat_intel_counts().values()))),
+        ("cves", "Matching CVEs", cve_stage),
+        ("sigma_yara", "Applying Sigma/YARA rules", rule_stage),
+        ("risk_scores", "Calculating risk scores", lambda: summarize_counts().get("alerts", 0)),
+        ("summary", "Generating summary", lambda: summarize_counts().get("scan_results", 0)),
+        ("completed", "Completed", lambda: 0),
+    ]
+    results: dict[str, int | float | str] = {}
+    scanned_count = 0
+    for index, (name, label, collector) in enumerate(stages, start=1):
+        if stop_event and stop_event.is_set():
+            results["status"] = "cancelled"
+            break
+        value = collector()
+        results[name] = value
+        if isinstance(value, int):
+            scanned_count += value
+        if progress_callback:
+            elapsed = time.perf_counter() - start
+            progress = round(index * 100 / len(stages))
+            eta = (elapsed / index * (len(stages) - index)) if index else 0.0
+            resources = sample_system_metrics()
+            progress_callback(
+                {
+                    "progress": progress,
+                    "stage": label,
+                    "elapsed_seconds": elapsed,
+                    "eta_seconds": eta,
+                    "scanned_count": scanned_count,
+                    "completed_stages": index,
+                    "total_stages": len(stages),
+                    "current_item": label,
+                    **resources,
+                }
+            )
+    else:
+        results["status"] = "completed"
     elapsed_ms = (time.perf_counter() - start) * 1000
     record_metric("full_scan_time", elapsed_ms, "ms", results)
     record_system_metrics("full_endpoint_scan")

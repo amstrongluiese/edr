@@ -11,9 +11,11 @@ data/
 reports/
 archives/
 logs/
+output/
 dist/
 build/
 *.spec
+!EDR_System.spec
 
 .agents/
 .codex/

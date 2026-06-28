@@ -47,26 +47,30 @@ def scan_presence(offline_after_seconds: int = 25) -> dict[str, int]:
         analyze_event(event)
 
     offline = 0
-    rows = fetch_all("SELECT id, ip, mac, hostname, last_seen, online_status FROM devices WHERE session_id = ? AND is_inventory_device = 1", (session_id,))
-    current = datetime.now(timezone.utc)
+    rows = fetch_all("SELECT id, ip, mac, hostname, last_seen, online_status, missed_scans FROM devices WHERE session_id = ? AND is_inventory_device = 1", (session_id,))
     for row in rows:
         key = _device_key(row["ip"], row["mac"], row["hostname"])
-        age = (current - _parse_ts(row["last_seen"])).total_seconds()
-        if key not in seen_keys and age >= offline_after_seconds and row["online_status"] != "offline":
-            execute("UPDATE devices SET online_status = 'offline' WHERE id = ?", (row["id"],))
+        if key in seen_keys:
+            execute("UPDATE devices SET missed_scans = 0, online_status = 'online' WHERE id = ?", (row["id"],))
+            continue
+        missed = int(row["missed_scans"] or 0) + 1
+        if missed >= 6 and row["online_status"] != "offline":
+            execute("UPDATE devices SET missed_scans = ?, online_status = 'offline' WHERE id = ?", (missed, row["id"]))
             record_session_event(
                 "device_offline",
                 row["ip"],
-                {"ip": row["ip"], "mac": row["mac"], "hostname": row["hostname"], "last_seen": row["last_seen"], "offline_after_seconds": offline_after_seconds},
+                {"ip": row["ip"], "mac": row["mac"], "hostname": row["hostname"], "last_seen": row["last_seen"], "missed_scans": missed},
             )
             offline += 1
-        elif key not in seen_keys and row["online_status"] == "online" and age >= max(5, offline_after_seconds // 2):
-            execute("UPDATE devices SET online_status = 'recently_seen' WHERE id = ?", (row["id"],))
+        elif missed >= 3:
+            execute("UPDATE devices SET missed_scans = ?, online_status = 'recently_seen' WHERE id = ?", (missed, row["id"]))
             record_session_event(
                 "device_recently_seen",
                 row["ip"],
-                {"ip": row["ip"], "mac": row["mac"], "hostname": row["hostname"], "last_seen": row["last_seen"]},
+                {"ip": row["ip"], "mac": row["mac"], "hostname": row["hostname"], "last_seen": row["last_seen"], "missed_scans": missed},
             )
+        else:
+            execute("UPDATE devices SET missed_scans = ? WHERE id = ?", (missed, row["id"]))
 
     execute(
         "INSERT INTO performance_metrics(timestamp, metric_name, metric_value, unit, context, session_id) VALUES (?, ?, ?, ?, ?, ?)",

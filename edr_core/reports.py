@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .ai_analyst import generate_analysis
 from .config import REPORT_DIR
-from .db import execute, fetch_all, init_db, utc_now
+from .db import execute, fetch_all, fetch_one, init_db, utc_now
 from .detection import summarize_counts
 from .sessions import get_current_session_id
 
@@ -34,10 +34,14 @@ def technical_report() -> Path:
     ]
     if alerts:
         for row in alerts:
-            lines.append(f"- Alert {row['id']}: {row['alert_type']} on {row['entity']} scored {row['score']} ({row['severity']}). Reason: {row['reason']}")
+            lines.append(
+                f"- Alert {row['id']}: {row['classification']} at {row['confidence_score']}% confidence; "
+                f"risk score {row['score']}; {row['evidence_count']} evidence item(s); {row['alert_type']} on {row['entity']}; "
+                f"MITRE {row['mitre_id']} {row['mitre_tactic']}/{row['mitre_technique']}. Reason: {row['reason']}. Evidence: {row['evidence']}"
+            )
     else:
         lines.append("- No alerts have been generated.")
-    lines.extend(["", "## Severity", "Severity is derived from weighted, capped scores: informational, low risk, suspicious, high risk, and critical."])
+    lines.extend(["", "## Classification", "Weak evidence stays informational or low risk. Suspicious requires stacked evidence; confirmed threat requires malicious IoC evidence."])
     return _write_report("technical_report.md", "\n".join(lines))
 
 
@@ -67,7 +71,10 @@ def validation_report() -> Path:
         "## Test Results",
     ]
     for row in rows:
-        lines.append(f"- {row['test_name']}: {row['outcome']} in {row['response_ms']:.2f} ms. Notes: {row['notes']}")
+        lines.append(
+            f"- {row['test_name']}: expected {row['expected_label']}, actual {row['actual_label']}, "
+            f"{row['outcome']} at {row['confidence_score']}% confidence in {row['response_ms']:.2f} ms."
+        )
     return _write_report("validation_report.md", "\n".join(lines))
 
 
@@ -85,6 +92,13 @@ def final_overall_report() -> Path:
         validations = []
     metrics = fetch_all("SELECT * FROM performance_metrics WHERE session_id = ? ORDER BY id DESC LIMIT 30", (session_id,)) if session_id else []
     verification = fetch_all("SELECT * FROM testing_verification WHERE session_id = ? ORDER BY id DESC", (session_id,)) if session_id else []
+    alerts = fetch_all("SELECT * FROM alerts WHERE session_id = ? ORDER BY id DESC", (session_id,)) if session_id else []
+    safe_dns = fetch_one("SELECT COUNT(*) AS count FROM dns_logs WHERE session_id = ? AND classification = 'SAFE'", (session_id,)) if session_id else None
+    confirmed = [row for row in alerts if row["classification"] == "CONFIRMED THREAT"]
+    suspicious = [row for row in alerts if row["classification"] in {"SUSPICIOUS", "HIGH RISK"}]
+    sigma_matches = [row for row in alerts if row["alert_type"] == "sigma_rule"]
+    yara_matches = [row for row in alerts if row["alert_type"] == "yara_rule"]
+    ioc_matches = [row for row in alerts if str(row["alert_type"]).startswith("malicious_")]
     outcomes = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
     for row in validations:
         outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
@@ -97,21 +111,25 @@ def final_overall_report() -> Path:
     lines = [
         "# Final Overall Security Report",
         "",
+        f"## Final Verdict: {'CONFIRMED THREAT: evidence found' if confirmed else 'SAFE: no confirmed threat found'}",
+        "",
         "## What was scanned?",
         f"Devices={counts['devices']}, scan records={counts['scan_results']}, files={counts['file_events']}, processes={counts['process_events']}, connections={counts['connections']}, DNS={counts['dns_logs']}, logs={counts['log_events']}.",
         "",
         "## What was detected?",
         f"Alerts={counts['alerts']}, incidents={counts['incidents']}, failed-attempt clusters={counts['failed_attempts']}, CVE matches={counts['cve_matches']}.",
+        f"Safe findings={int(safe_dns['count'] if safe_dns else 0)}, suspicious/high findings={len(suspicious)}, confirmed findings={len(confirmed)}.",
+        f"IoC matches={len(ioc_matches)}, Sigma matches={len(sigma_matches)}, YARA matches={len(yara_matches)}.",
         "",
         "## Was it a true detection?",
         f"Validation TP={outcomes['TP']} TN={outcomes['TN']} FP={outcomes['FP']} FN={outcomes['FN']}.",
         f"Testing verification records={len(verification)}.",
         "",
         "## Why was it flagged?",
-        "Each alert stores evidence JSON, score, reason, data source, and MITRE mapping in SQLite.",
+        "Each alert stores its evidence list/count, confidence, explanation, data source, and MITRE mapping in SQLite.",
         "",
         "## How severe was it?",
-        "Severity follows weighted evidence-based risk scoring. Unknown device alone remains informational.",
+        "Classification is evidence-gated: weak findings remain informational/low risk, suspicious requires stacked evidence, and confirmed requires malicious IoC evidence.",
         "",
         "## How accurate is the system?",
         f"Detection accuracy={accuracy:.2%}; false positive rate={fpr:.2%}; false negative rate={fnr:.2%}; average detection time={avg_detection:.2f} ms.",

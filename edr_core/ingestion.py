@@ -6,6 +6,7 @@ from typing import Any
 from .db import execute, fetch_one, json_dumps, utc_now
 from .models import NormalizedEvent
 from .sessions import get_current_session_id
+from .website_safety import classify_domain
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -117,6 +118,7 @@ def persist_event(event: NormalizedEvent) -> None:
                         last_seen = ?,
                         trust_status = ?,
                         online_status = ?,
+                        missed_scans = 0,
                         discovery_source = ?,
                         device_key = ?,
                         is_inventory_device = ?
@@ -152,6 +154,7 @@ def persist_event(event: NormalizedEvent) -> None:
                 last_seen=excluded.last_seen,
                 trust_status=excluded.trust_status,
                 online_status=excluded.online_status,
+                missed_scans=0,
                 discovery_source=excluded.discovery_source,
                 device_key=excluded.device_key,
                 is_inventory_device=excluded.is_inventory_device
@@ -175,10 +178,11 @@ def persist_event(event: NormalizedEvent) -> None:
         )
     elif event.event_type in {"dns", "dns_query"} and event.domain:
         _observe_ip(event.source_ip, event.timestamp, "passive_network_observation")
+        classification, confidence_score, _ = classify_domain(event.domain, event.url)
         execute(
             """
-            INSERT INTO dns_logs(timestamp, source_ip, domain, query_type, resolved_ip, raw_event, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO dns_logs(timestamp, source_ip, domain, query_type, resolved_ip, classification, confidence_score, raw_event, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.timestamp,
@@ -186,6 +190,8 @@ def persist_event(event: NormalizedEvent) -> None:
                 event.domain,
                 event.query_type,
                 event.resolved_ip,
+                classification,
+                confidence_score,
                 json_dumps(event.raw),
                 session_id,
             ),
@@ -311,7 +317,7 @@ def _observe_ip(ip: str | None, timestamp: str, source: str) -> None:
     execute(
         """
         INSERT INTO devices(ip, first_seen, last_seen, trust_status, risk_level, risk_score, online_status, discovery_source, device_key, is_inventory_device, session_id)
-        VALUES (?, ?, ?, 'unknown', 'Informational', 0, 'online', ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'unknown', 'SAFE', 0, 'online', ?, ?, ?, ?)
         ON CONFLICT(ip) DO UPDATE SET
             last_seen=excluded.last_seen,
             online_status='online',

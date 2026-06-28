@@ -1,0 +1,9 @@
+{
+  "id": "sigma-powershell-encoded-command",
+  "title": "Suspicious PowerShell Encoded or Download Command",
+  "attack_id": "T1059.001",
+  "tactic": "Execution",
+  "processes": ["powershell.exe", "pwsh.exe"],
+  "command_markers": ["-enc", "frombase64string", "downloadstring", "invoke-webrequest", "iex", "executionpolicy bypass"],
+  "score": 35
+}

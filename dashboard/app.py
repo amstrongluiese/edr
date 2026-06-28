@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -12,7 +13,7 @@ from edr_core.db import fetch_all, init_db
 from edr_core.device_discovery import import_discovered_devices
 from edr_core.detection import summarize_counts
 from edr_core.file_monitor import snapshot_monitored_files
-from edr_core.dns_monitor import collect_dns_cache, detect_doh_connections
+from edr_core.dns_monitor import collect_dns_cache, detect_doh_connections, scan_browser_history
 from edr_core.full_scan import collect_windows_event_logs, run_full_scan, scan_open_ports, scan_processes, scan_services, scan_startup_programs
 from edr_core.live_presence import scan_presence
 from edr_core.log_monitor import import_log_file
@@ -38,6 +39,17 @@ SUCCESS = "#059669"
 BORDER = "#d9e3ef"
 
 
+class AutoHideScrollbar(ttk.Scrollbar):
+    """Thin scrollbar that appears only when its target cannot fit."""
+
+    def set(self, first: str, last: str) -> None:
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.grid_remove()
+        else:
+            self.grid()
+        super().set(first, last)
+
+
 PAGE_QUERIES: dict[str, tuple[str, list[str]]] = {
     "Devices": (
         """
@@ -57,7 +69,10 @@ PAGE_QUERIES: dict[str, tuple[str, list[str]]] = {
         SELECT MAX(last_seen) AS last_seen,
                alert_type,
                entity,
-               (SELECT severity FROM alerts a2 WHERE a2.alert_type = alerts.alert_type AND a2.entity = alerts.entity AND a2.session_id = alerts.session_id ORDER BY score DESC LIMIT 1) AS severity,
+               (SELECT classification FROM alerts a2 WHERE a2.alert_type = alerts.alert_type AND a2.entity = alerts.entity AND a2.session_id = alerts.session_id ORDER BY confidence_score DESC LIMIT 1) AS classification,
+               MAX(confidence_score) AS confidence_score,
+               MAX(evidence_count) AS evidence_count,
+               (SELECT confidence_label FROM alerts a2 WHERE a2.alert_type = alerts.alert_type AND a2.entity = alerts.entity AND a2.session_id = alerts.session_id ORDER BY confidence_score DESC LIMIT 1) AS confidence,
                MAX(score) AS score,
                SUM(occurrence_count) AS occurrence_count,
                (SELECT reason FROM alerts a3 WHERE a3.alert_type = alerts.alert_type AND a3.entity = alerts.entity AND a3.session_id = alerts.session_id ORDER BY last_seen DESC LIMIT 1) AS reason,
@@ -69,10 +84,11 @@ PAGE_QUERIES: dict[str, tuple[str, list[str]]] = {
         ORDER BY MAX(score) DESC, SUM(occurrence_count) DESC, MAX(last_seen) DESC
         LIMIT 500
         """,
-        ["last_seen", "alert_type", "entity", "severity", "score", "occurrence_count", "reason", "mitre_id", "status"],
+        ["last_seen", "alert_type", "entity", "classification", "confidence_score", "confidence", "evidence_count", "score", "occurrence_count", "reason", "mitre_id", "status"],
     ),
     "Connections": ("SELECT timestamp, process_name, pid, source_ip, destination_ip, source_port, port, direction, protocol, event_type FROM connections WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "process_name", "pid", "source_ip", "destination_ip", "source_port", "port", "direction", "protocol", "event_type"]),
-    "DNS": ("SELECT timestamp, source_ip, domain, query_type, resolved_ip FROM dns_logs WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "source_ip", "domain", "query_type", "resolved_ip"]),
+    "DNS": ("SELECT timestamp, source_ip, domain, query_type, resolved_ip, classification, confidence_score FROM dns_logs WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "source_ip", "domain", "query_type", "resolved_ip", "classification", "confidence_score"]),
+    "Website Safety": ("SELECT timestamp, domain, classification, confidence_score, query_type, resolved_ip FROM dns_logs WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "domain", "classification", "confidence_score", "query_type", "resolved_ip"]),
     "Logs": ("SELECT timestamp, log_source, event_type, username, source_ip, device, target_system, outcome FROM log_events WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "log_source", "event_type", "username", "source_ip", "device", "target_system", "outcome"]),
     "Failed Attempts": ("SELECT timestamp, username, source_ip, device, target_system, failed_count, window_seconds, status FROM failed_attempts WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "username", "source_ip", "device", "target_system", "failed_count", "window_seconds", "status"]),
     "Threat Intelligence": ("SELECT indicator, indicator_type, source, confidence, last_seen FROM threat_intelligence WHERE ? IS NOT NULL ORDER BY indicator_type, indicator LIMIT 500", ["indicator", "indicator_type", "source", "confidence", "last_seen"]),
@@ -81,7 +97,7 @@ PAGE_QUERIES: dict[str, tuple[str, list[str]]] = {
     "Performance": ("SELECT timestamp, metric_name, metric_value, unit, context FROM performance_metrics WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "metric_name", "metric_value", "unit", "context"]),
     "Incidents": ("SELECT updated_at, title, severity, score, status, evidence FROM incidents WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["updated_at", "title", "severity", "score", "status", "evidence"]),
     "Reports": ("SELECT created_at, report_type, path, summary FROM reports WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["created_at", "report_type", "path", "summary"]),
-    "Validation": ("SELECT timestamp, test_name, expected_malicious, detected_malicious, outcome, response_ms, notes FROM validation_results WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "test_name", "expected_malicious", "detected_malicious", "outcome", "response_ms", "notes"]),
+    "Validation": ("SELECT timestamp, test_name, expected_label, actual_label, outcome, confidence_score, response_ms, cpu_seconds, memory_mb, notes FROM validation_results WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "test_name", "expected_label", "actual_label", "outcome", "confidence_score", "response_ms", "cpu_seconds", "memory_mb", "notes"]),
     "Archive / History": ("SELECT session_id, started_at, stopped_at, status, total_alerts, total_incidents, detection_accuracy, archive_path FROM sessions ORDER BY started_at DESC LIMIT 500", ["session_id", "started_at", "stopped_at", "status", "total_alerts", "total_incidents", "detection_accuracy", "archive_path"]),
 }
 
@@ -101,6 +117,22 @@ class EdrDashboard(tk.Tk):
         self.scan_status = "Stopped"
         self.last_refresh = "Never"
         self.monitoring_running = False
+        self.scan_in_progress = False
+        self.manual_scan_stop = threading.Event()
+        self.scan_progress = 0
+        self.scan_progress_text = "Ready"
+        self.scan_started_at = 0.0
+        self.scan_elapsed_seconds = 0.0
+        self.scan_eta_seconds = 0.0
+        self.scan_scanned_count = 0
+        self.scan_completed_stages = 0
+        self.scan_total_stages = 17
+        self.scan_current_item = ""
+        self.scan_cpu_seconds = 0.0
+        self.scan_memory_mb = 0.0
+        self._scan_tick_scheduled = False
+        self.last_ui_signature: tuple[Any, ...] | None = None
+        self._wheel_remainder = 0.0
         self.stop_event = threading.Event()
         self.sort_state: dict[str, bool] = {}
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -112,15 +144,55 @@ class EdrDashboard(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Treeview", rowheight=31, font=("Segoe UI", 9), fieldbackground=CARD, background=CARD, borderwidth=0)
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background="#eaf2fb", foreground=TEXT, relief="flat", padding=(8, 8))
-        style.map("Treeview", background=[("selected", "#dff3ff")], foreground=[("selected", TEXT)])
-        style.configure("Vertical.TScrollbar", gripcount=0, background="#dbeafe", troughcolor="#f8fbff", bordercolor="#f8fbff", arrowcolor=ACCENT_DARK)
-        style.configure("Horizontal.TScrollbar", gripcount=0, background="#dbeafe", troughcolor="#f8fbff", bordercolor="#f8fbff", arrowcolor=ACCENT_DARK)
+        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), background="#edf5fb", foreground=TEXT, relief="flat", padding=(8, 8))
+        style.map("Treeview", background=[("selected", "#dcefff")], foreground=[("selected", TEXT)])
+        style.layout(
+            "Win11.Vertical.TScrollbar",
+            [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})],
+        )
+        style.layout(
+            "Win11.Horizontal.TScrollbar",
+            [("Horizontal.Scrollbar.trough", {"sticky": "ew", "children": [("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})],
+        )
+        style.configure("Win11.Vertical.TScrollbar", gripcount=0, width=8, borderwidth=0, background="#b9cbd9", troughcolor="#f7fafc")
+        style.configure("Win11.Horizontal.TScrollbar", gripcount=0, width=8, borderwidth=0, background="#b9cbd9", troughcolor="#f7fafc")
+        style.map(
+            "Win11.Vertical.TScrollbar",
+            background=[("active", "#7f9caf"), ("pressed", "#5f7f95")],
+        )
+        style.map(
+            "Win11.Horizontal.TScrollbar",
+            background=[("active", "#7f9caf"), ("pressed", "#5f7f95")],
+        )
 
     def _build_shell(self) -> None:
-        self.sidebar = tk.Frame(self, bg=SIDEBAR, width=236, highlightthickness=1, highlightbackground=BORDER)
-        self.sidebar.pack(side="left", fill="y")
-        self.sidebar.pack_propagate(False)
+        sidebar_shell = tk.Frame(self, bg=SIDEBAR, width=236, highlightthickness=1, highlightbackground=BORDER)
+        sidebar_shell.pack(side="left", fill="y")
+        sidebar_shell.pack_propagate(False)
+        sidebar_shell.grid_rowconfigure(0, weight=1)
+        sidebar_shell.grid_columnconfigure(0, weight=1)
+
+        self.sidebar_canvas = tk.Canvas(sidebar_shell, bg=SIDEBAR, bd=0, highlightthickness=0, width=228)
+        self.sidebar_scrollbar = AutoHideScrollbar(
+            sidebar_shell,
+            orient="vertical",
+            command=self.sidebar_canvas.yview,
+            style="Win11.Vertical.TScrollbar",
+        )
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_scrollbar.set)
+        self.sidebar_canvas.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.sidebar = tk.Frame(self.sidebar_canvas, bg=SIDEBAR)
+        self.sidebar_window = self.sidebar_canvas.create_window((0, 0), window=self.sidebar, anchor="nw")
+        self.sidebar.bind(
+            "<Configure>",
+            lambda _event: self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all")),
+        )
+        self.sidebar_canvas.bind(
+            "<Configure>",
+            lambda event: self.sidebar_canvas.itemconfigure(self.sidebar_window, width=event.width),
+        )
 
         brand = tk.Frame(self.sidebar, bg=SIDEBAR)
         brand.pack(fill="x", padx=18, pady=(20, 14))
@@ -128,7 +200,7 @@ class EdrDashboard(tk.Tk):
         tk.Label(brand, text="SOC command center", bg=SIDEBAR, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
 
         pages = [
-            "Overview", "Full Scan", "Devices", "Files", "Processes", "Alerts", "Connections", "DNS",
+            "Overview", "Full Scan", "Devices", "Files", "Processes", "Alerts", "Connections", "DNS", "Website Safety",
             "Logs", "Failed Attempts", "Threat Intelligence", "CVE Matches", "MITRE Mapping",
             "Performance", "Incidents", "Validation", "Testing Verification", "Reports", "Archive / History", "AI Analyst", "Settings",
         ]
@@ -154,6 +226,53 @@ class EdrDashboard(tk.Tk):
 
         self.main = tk.Frame(self, bg=BG)
         self.main.pack(side="left", fill="both", expand=True)
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel, add="+")
+
+    @staticmethod
+    def _is_descendant(widget: tk.Misc | None, ancestor: tk.Misc) -> bool:
+        current = widget
+        while current is not None:
+            if current == ancestor:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _wheel_units(self, delta: int) -> int:
+        self._wheel_remainder += (-delta / 120.0) * 3.0
+        units = int(self._wheel_remainder)
+        self._wheel_remainder -= units
+        return units
+
+    def _on_mousewheel(self, event: tk.Event[Any]) -> str | None:
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        units = self._wheel_units(event.delta)
+        if not units:
+            return "break"
+        current = widget
+        while current is not None:
+            if isinstance(current, ttk.Treeview):
+                current.yview_scroll(units, "units")
+                return "break"
+            if isinstance(current, tk.Text):
+                current.yview_scroll(units, "units")
+                return "break"
+            current = getattr(current, "master", None)
+        if self._is_descendant(widget, self.sidebar):
+            self.sidebar_canvas.yview_scroll(units, "units")
+            return "break"
+        return None
+
+    def _on_shift_mousewheel(self, event: tk.Event[Any]) -> str | None:
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        units = self._wheel_units(event.delta)
+        current = widget
+        while current is not None:
+            if isinstance(current, ttk.Treeview):
+                current.xview_scroll(units, "units")
+                return "break"
+            current = getattr(current, "master", None)
+        return None
 
     def _clear(self) -> None:
         for child in self.main.winfo_children():
@@ -175,6 +294,7 @@ class EdrDashboard(tk.Tk):
             self._pill_button(header, "Stop Monitoring", self.stop_monitoring_action).pack(side="right", padx=(0, 8))
         else:
             self._pill_button(header, "Start Monitoring", self.start_monitoring_action, True).pack(side="right", padx=(0, 8))
+        self._render_global_scan_status()
 
         if page == "Overview":
             self.page_overview()
@@ -182,6 +302,8 @@ class EdrDashboard(tk.Tk):
             self.page_full_scan()
         elif page == "Logs":
             self.page_logs()
+        elif page == "Website Safety":
+            self.page_website_safety()
         elif page == "Validation":
             self.page_validation()
         elif page == "Testing Verification":
@@ -216,6 +338,43 @@ class EdrDashboard(tk.Tk):
             font=("Segoe UI Semibold", 9),
             cursor="hand2",
         )
+
+    def _render_global_scan_status(self) -> None:
+        bar = tk.Frame(self.main, bg="#f7fbfe", highlightthickness=1, highlightbackground=BORDER)
+        bar.pack(fill="x", padx=24, pady=(0, 12))
+        self.global_scan_text = tk.StringVar()
+        self.global_scan_resource_text = tk.StringVar()
+        tk.Label(bar, textvariable=self.global_scan_text, bg="#f7fbfe", fg=TEXT, font=("Segoe UI Semibold", 9)).pack(side="left", padx=12, pady=8)
+        ttk.Progressbar(bar, maximum=100, value=self.scan_progress, length=220).pack(side="left", padx=(4, 12), fill="x", expand=True)
+        tk.Label(bar, textvariable=self.global_scan_resource_text, bg="#f7fbfe", fg=MUTED, font=("Segoe UI", 8)).pack(side="right", padx=12)
+        self._update_global_scan_text()
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    def _update_global_scan_text(self) -> None:
+        if self.scan_in_progress and self.scan_started_at:
+            self.scan_elapsed_seconds = time.perf_counter() - self.scan_started_at
+        status = "Scanning" if self.scan_in_progress else self.scan_progress_text
+        if hasattr(self, "global_scan_text"):
+            self.global_scan_text.set(
+                f"{status}  •  {self.scan_progress}%  •  {self.scan_progress_text}  •  "
+                f"Elapsed {self._format_duration(self.scan_elapsed_seconds)}  •  ETA {self._format_duration(self.scan_eta_seconds)}"
+            )
+        if hasattr(self, "global_scan_resource_text"):
+            self.global_scan_resource_text.set(
+                f"Scanned {self.scan_scanned_count}  |  Stage {self.scan_completed_stages}/{self.scan_total_stages}  |  "
+                f"CPU {self.scan_cpu_seconds:.2f}s  |  RAM {self.scan_memory_mb:.1f} MB"
+            )
+
+    def _tick_scan_status(self) -> None:
+        self._scan_tick_scheduled = False
+        self._update_global_scan_text()
+        if self.scan_in_progress:
+            self._scan_tick_scheduled = True
+            self.after(1000, self._tick_scan_status)
 
     def metric_card(self, parent: tk.Widget, title: str, value: str, subtext: str = "", color: str = TEXT) -> None:
         frame = self._panel(parent, 14, 12)
@@ -278,9 +437,25 @@ class EdrDashboard(tk.Tk):
     def page_full_scan(self) -> None:
         actions = tk.Frame(self.main, bg=BG)
         actions.pack(fill="x", padx=24, pady=(0, 12))
-        self._pill_button(actions, "Run Full Endpoint Scan", self.full_scan_action, True).pack(side="left", padx=(0, 8))
+        start_button = self._pill_button(actions, "Scan Running" if self.scan_in_progress else "Run Full Endpoint Scan", self.full_scan_action, True)
+        start_button.pack(side="left", padx=(0, 8))
+        if self.scan_in_progress:
+            start_button.configure(state="disabled")
+        if self.scan_in_progress:
+            self._pill_button(actions, "Cancel Scan", self.cancel_full_scan_action).pack(side="left", padx=(0, 8))
         self._pill_button(actions, "Snapshot Monitored Files", self.file_snapshot_action).pack(side="left")
+        progress = ttk.Progressbar(self.main, maximum=100, value=self.scan_progress)
+        progress.pack(fill="x", padx=24, pady=(0, 4))
+        tk.Label(self.main, text=f"{self.scan_progress}% — {self.scan_progress_text}", bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=24, pady=(0, 8))
         self.page_table("SELECT timestamp, scan_type, target, item_type, risk_score, risk_level, status FROM scan_results WHERE session_id = ? ORDER BY id DESC LIMIT 500", ["timestamp", "scan_type", "target", "item_type", "risk_score", "risk_level", "status"])
+
+    def page_website_safety(self) -> None:
+        actions = tk.Frame(self.main, bg=BG)
+        actions.pack(fill="x", padx=24, pady=(0, 12))
+        self._pill_button(actions, "Capture DNS Cache", self.dns_capture_action, True).pack(side="left", padx=(0, 8))
+        self._pill_button(actions, "Detect DNS-over-HTTPS", self.doh_scan_action).pack(side="left", padx=(0, 8))
+        self._pill_button(actions, "Optional Browser History Scan", self.browser_history_action).pack(side="left")
+        self.page_table(*PAGE_QUERIES["Website Safety"])
 
     def page_logs(self) -> None:
         actions = tk.Frame(self.main, bg=BG)
@@ -357,8 +532,8 @@ class EdrDashboard(tk.Tk):
         tree.tag_configure("critical", foreground=DANGER)
         tree.tag_configure("high", foreground=WARN)
         tree.tag_configure("ok", foreground=SUCCESS)
-        vsb = ttk.Scrollbar(holder, orient="vertical", command=tree.yview, style="Vertical.TScrollbar")
-        hsb = ttk.Scrollbar(holder, orient="horizontal", command=tree.xview, style="Horizontal.TScrollbar")
+        vsb = AutoHideScrollbar(holder, orient="vertical", command=tree.yview, style="Win11.Vertical.TScrollbar")
+        hsb = AutoHideScrollbar(holder, orient="horizontal", command=tree.xview, style="Win11.Horizontal.TScrollbar")
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         for col in columns:
             tree.heading(col, text=col.replace("_", " ").title(), command=lambda c=col, t=tree: self._sort_tree(t, c))
@@ -408,8 +583,13 @@ class EdrDashboard(tk.Tk):
     def page_ai(self) -> None:
         frame = self._panel(self.main, 18, 16)
         frame.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
         text = tk.Text(frame, wrap="word", bg=PANEL, fg=TEXT, font=("Consolas", 10), relief="flat", bd=0)
-        text.pack(fill="both", expand=True)
+        scrollbar = AutoHideScrollbar(frame, orient="vertical", command=text.yview, style="Win11.Vertical.TScrollbar")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
         text.insert("1.0", generate_analysis())
         text.configure(state="disabled")
 
@@ -460,9 +640,89 @@ class EdrDashboard(tk.Tk):
         if not get_current_session_id():
             messagebox.showinfo("Monitoring Not Started", "Start Monitoring before running a full scan.")
             return
-        result = run_full_scan()
-        messagebox.showinfo("Full Scan Complete", "\n".join(f"{key}: {value}" for key, value in result.items()))
+        if self.scan_in_progress:
+            return
+        self.scan_in_progress = True
+        self.manual_scan_stop.clear()
+        self.scan_progress = 0
+        self.scan_progress_text = "Starting"
+        self.scan_started_at = time.perf_counter()
+        self.scan_elapsed_seconds = 0.0
+        self.scan_eta_seconds = 0.0
+        self.scan_scanned_count = 0
+        self.scan_completed_stages = 0
         self.show_page("Full Scan")
+        if not self._scan_tick_scheduled:
+            self._scan_tick_scheduled = True
+            self.after(1000, self._tick_scan_status)
+        session_id = get_current_session_id()
+        threading.Thread(target=self._full_scan_worker, args=(session_id,), daemon=True).start()
+
+    def _full_scan_worker(self, session_id: str | None) -> None:
+        set_current_session_id(session_id)
+
+        def progress(payload: dict[str, Any]) -> None:
+            self.scan_progress = int(payload["progress"])
+            self.scan_progress_text = str(payload["stage"])
+            self.scan_elapsed_seconds = float(payload["elapsed_seconds"])
+            self.scan_eta_seconds = float(payload["eta_seconds"])
+            self.scan_scanned_count = int(payload["scanned_count"])
+            self.scan_completed_stages = int(payload["completed_stages"])
+            self.scan_total_stages = int(payload["total_stages"])
+            self.scan_current_item = str(payload["current_item"])
+            self.scan_cpu_seconds = float(payload["cpu_seconds"])
+            self.scan_memory_mb = float(payload["memory_mb"])
+            self.after(0, lambda: self.current_page == "Full Scan" and self.show_page("Full Scan"))
+
+        try:
+            result = run_full_scan(progress_callback=progress, stop_event=self.manual_scan_stop)
+        except Exception as exc:
+            result = {"status": "failed", "error": str(exc)}
+        self.scan_in_progress = False
+        self.scan_elapsed_seconds = time.perf_counter() - self.scan_started_at
+        self.scan_eta_seconds = 0.0
+        self.scan_progress = 100 if result.get("status") == "completed" else self.scan_progress
+        self.scan_progress_text = str(result.get("status", "completed")).title()
+        self.after(0, lambda: self._full_scan_finished(result))
+
+    def _full_scan_finished(self, result: dict[str, Any]) -> None:
+        self.show_page("Full Scan")
+        messagebox.showinfo("Full Scan", "\n".join(f"{key}: {value}" for key, value in result.items()))
+
+    def cancel_full_scan_action(self) -> None:
+        if self.scan_in_progress:
+            self.manual_scan_stop.set()
+            self.scan_progress_text = "Cancelling after current collector"
+
+    def dns_capture_action(self) -> None:
+        if not get_current_session_id():
+            messagebox.showinfo("Monitoring Not Started", "Start Monitoring before website safety analysis.")
+            return
+        result = collect_dns_cache()
+        messagebox.showinfo("DNS Capture", str(result))
+        self.show_page("Website Safety")
+
+    def doh_scan_action(self) -> None:
+        if not get_current_session_id():
+            messagebox.showinfo("Monitoring Not Started", "Start Monitoring before website safety analysis.")
+            return
+        result = detect_doh_connections()
+        messagebox.showinfo("DNS-over-HTTPS", str(result))
+        self.show_page("Website Safety")
+
+    def browser_history_action(self) -> None:
+        if not get_current_session_id():
+            messagebox.showinfo("Monitoring Not Started", "Start Monitoring before website safety analysis.")
+            return
+        allowed = messagebox.askyesno(
+            "Read-only Browser History",
+            "Allow a one-time read-only scan of local Chrome and Edge history? The browser databases are copied temporarily and are not modified.",
+        )
+        if not allowed:
+            return
+        count = scan_browser_history(read_only_permission=True)
+        messagebox.showinfo("Browser History", f"Classified {count} local history entries.")
+        self.show_page("Website Safety")
 
     def file_snapshot_action(self) -> None:
         if not get_current_session_id():
@@ -545,9 +805,19 @@ class EdrDashboard(tk.Tk):
                 self.scan_status = f"Idle (collector warning)"
             finally:
                 self.scan_status = "Idle" if self.monitoring_running else "Stopped"
-                self.after(0, lambda: self.show_page(self.current_page))
+                signature_rows = fetch_all(
+                    "SELECT (SELECT COUNT(*) FROM devices WHERE session_id = ?) AS devices, "
+                    "(SELECT COUNT(*) FROM alerts WHERE session_id = ?) AS alerts, "
+                    "(SELECT COUNT(*) FROM dns_logs WHERE session_id = ?) AS dns, "
+                    "(SELECT COALESCE(MAX(last_seen), '') FROM devices WHERE session_id = ?) AS device_change",
+                    (session_id, session_id, session_id, session_id),
+                )
+                signature = tuple(signature_rows[0]) if signature_rows else ()
+                if signature != self.last_ui_signature:
+                    self.last_ui_signature = signature
+                    self.after(0, lambda: self.show_page(self.current_page))
             tick += 1
-            self.stop_event.wait(5)
+            self.stop_event.wait(10)
 
     def stop_monitoring_action(self) -> None:
         session_id = get_current_session_id()

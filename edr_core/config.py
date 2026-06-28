@@ -1,7 +1,8 @@
+import sys
 from pathlib import Path
 
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 REPORT_DIR = BASE_DIR / "reports"
 THREAT_INTEL_DIR = BASE_DIR / "threat_intel"

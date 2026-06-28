@@ -1,0 +1,14 @@
+microsoft.com
+windowsupdate.com
+google.com
+youtube.com
+cloudflare.com
+meta.com
+facebook.com
+github.com
+githubusercontent.com
+office.com
+live.com
+azure.com
+akamai.net
+cloudfront.net

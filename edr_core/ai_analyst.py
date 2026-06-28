@@ -18,13 +18,14 @@ def generate_analysis(session_id: str | None = None) -> str:
         session_id = get_current_session_id()
     alerts = _rows("alerts", 20, session_id)
     incidents = _rows("incidents", 10, session_id)
-    validations = _rows("validation_results", 20, session_id)
+    validations = _rows("validation_results", 100, session_id)
     metrics = _rows("performance_metrics", 20, session_id)
     scan_results = _rows("scan_results", 10, session_id)
     failed_attempts = _rows("failed_attempts", 10, session_id)
     cves = _rows("cve_matches", 10, session_id)
 
-    high_alerts = [row for row in alerts if row["severity"] in {"High Risk", "Critical"}]
+    high_alerts = [row for row in alerts if row["classification"] in {"HIGH RISK", "CONFIRMED THREAT"}]
+    confirmed_alerts = [row for row in alerts if row["classification"] == "CONFIRMED THREAT"]
     outcomes = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
     for row in validations:
         outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
@@ -38,10 +39,11 @@ def generate_analysis(session_id: str | None = None) -> str:
         "Executive Summary",
         f"- Current evidence contains {len(alerts)} recent alerts and {len(incidents)} recent incidents.",
         f"- Recent endpoint scan records: {len(scan_results)}. Recent failed-attempt records: {len(failed_attempts)}. Recent CVE matches: {len(cves)}.",
-        f"- High or critical alert count in the current window: {len(high_alerts)}.",
+        f"- High-risk or confirmed alert count in the current window: {len(high_alerts)}.",
+        f"- Confirmed findings backed by IoC evidence: {len(confirmed_alerts)}.",
         f"- Validation accuracy from recorded tests: {accuracy:.2%}." if total_validations else "- No validation runs are recorded yet.",
         "",
-        "Threat Overview",
+        "Evidence Overview",
     ]
 
     if not alerts:
@@ -49,7 +51,10 @@ def generate_analysis(session_id: str | None = None) -> str:
     else:
         for row in alerts[:8]:
             evidence = json.loads(row["evidence"])
-            lines.append(f"- {row['severity']}: {row['alert_type']} on {row['entity']} scored {row['score']} because {row['reason']}")
+            lines.append(
+                f"- {row['classification']} ({row['confidence_score']}% confidence): "
+                f"{row['alert_type']} on {row['entity']} with {row['evidence_count']} evidence item(s). {row['reason']}"
+            )
             if evidence:
                 lines.append(f"  Evidence: {json.dumps(evidence, sort_keys=True)}")
 
@@ -65,8 +70,10 @@ def generate_analysis(session_id: str | None = None) -> str:
         lines.append(f"- Vulnerability risk is present: {len(cves)} CVE matches are recorded.")
 
     lines.extend(["", "Risk Assessment"])
-    if high_alerts:
-        lines.append("- Immediate review is recommended for high and critical alerts with malicious IoC, beaconing, or CVE evidence.")
+    if confirmed_alerts:
+        lines.append("- Confirmed malicious IoC evidence is present; immediate analyst review is recommended.")
+    elif high_alerts:
+        lines.append("- High-risk correlated evidence is present, but no compromise is asserted without confirmation.")
     else:
         lines.append("- Current recorded risk is below the high-risk threshold.")
 
@@ -91,5 +98,6 @@ def generate_analysis(session_id: str | None = None) -> str:
     else:
         lines.append("- Continue monitoring, refresh threat intelligence, and run validation before a demonstration.")
 
-    lines.extend(["", "Conclusion", "- This analysis only uses recorded alerts, incidents, validation data, and performance metrics. No unobserved compromise is asserted."])
+    verdict = "CONFIRMED THREAT: malicious IoC evidence found." if confirmed_alerts else "SAFE: no confirmed threat found in recorded evidence."
+    lines.extend(["", "Conclusion", f"- {verdict}", "- This analysis only uses recorded evidence. It does not call an item a threat without confirmation."])
     return "\n".join(lines)
